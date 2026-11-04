@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""agent-mesh: one set of instructions, memory and settings for Claude Code and Codex on every one of
+your machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by default).
+
+  agent-mesh init [--origin URL]  make a new mesh in ~/.agent-mesh (once, on your first machine)
+  agent-mesh setup        on each machine, after init or a clone: link memory, import AGENTS.md, add the
+                          Claude Code hooks (safe to run again; the same as sync)
+  agent-mesh sync         commit this machine's changes, merge the others', push, apply locally
+  agent-mesh sync --background   the same, detached (what the Claude Code hooks run)
+  agent-mesh timer        also sync every 10 minutes (systemd user timer / Windows scheduled task)
+  agent-mesh status       what is linked and whether this machine is in step
+  agent-mesh codex-notify [--then CMD...]   Codex's after-turn `notify` (set up by sync): syncs,
+                          then runs the notify command that was there before
+
+Extra Claude Code accounts (e.g. `CLAUDE_CONFIG_DIR=~/.claude-2 claude`) are any ~/.claude-<name>
+folders: sync points their CLAUDE.md, settings, skills, plugins and projects (memory) at ~/.claude.
+The mesh is wherever this script sits (<mesh>/bin/agent-mesh), else $AGENT_MESH_DIR, else ~/.agent-mesh.
+See https://github.com/Tjabooo/agent-mesh
+"""
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from functools import cache
+from pathlib import Path
+
+HOME = Path.home()
+TOOL = Path(__file__).resolve()
+TEMPLATE = TOOL.parent.parent / 'template'  # only in a checkout of the agent-mesh repo itself
+
+
+def find_mesh():
+    beside = TOOL.parent.parent
+    if (beside / 'memory').is_dir() and (beside / 'AGENTS.md').exists():
+        return beside  # the copy inside a mesh (what the hooks and timers run)
+    return Path(os.environ.get('AGENT_MESH_DIR') or HOME / '.agent-mesh').expanduser()
+
+
+REPO = find_mesh()
+WINDOWS = sys.platform == 'win32'
+CLAUDE = HOME / '.claude'
+CODEX = HOME / '.codex'
+MEMORY = REPO / 'memory'
+SHARED_SETTINGS = REPO / 'claude' / 'settings.json'
+SHARED_CODEX = REPO / 'codex' / 'config.toml'
+STATE = REPO / '.git' / 'agent-mesh-state.json'   # what was last applied here (never committed)
+LOG = REPO / '.git' / 'agent-mesh.log'
+LOCK = REPO / '.git' / 'agent-mesh.lock'
+IMPORT_LINE = '@' + (('~/' + REPO.relative_to(HOME).as_posix()) if REPO.is_relative_to(HOME) else REPO.as_posix()) + '/AGENTS.md'
+# Settings every machine shares. Everything else in settings.json stays per machine (hooks, the
+# permission mode and allow list, machine paths).
+SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask')
+CODEX_KEYS = ('model', 'model_reasoning_effort')
+MEMORY_INLINE = 40000  # characters of memory copied into Codex's AGENTS.md; longer files are linked
+HOST = socket.gethostname().lower()
+# Extra Claude accounts (`claude2` = CLAUDE_CONFIG_DIR=~/.claude-2): every ~/.claude-<name> folder.
+# These parts of one are the main ~/.claude's: links (on Windows, files are copies kept in step: a file
+# symlink needs admin there). Its login, .claude.json, prompt history and caches stay its own.
+ACCOUNT_SHARED = ('CLAUDE.md', 'settings.json', 'keybindings.json', 'skills', 'agents', 'commands',
+                  'plugins', 'projects', 'file-history')
+ACCOUNT_BACKUPS = REPO / '.git' / 'account-backups'
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    if sys.stdout and sys.stdout.isatty():
+        print(msg)
+    try:
+        with LOG.open('a', encoding='utf-8') as f:
+            f.write(line + '\n')
+    except OSError:
+        pass
+
+
+@cache
+def identity():
+    """A machine with no git identity still commits (as agent-mesh@<host>), so syncing never stalls."""
+    if subprocess.run(['git', '-C', str(REPO), 'config', 'user.email'], capture_output=True).returncode == 0:
+        return {}
+    return {'GIT_AUTHOR_NAME': 'agent-mesh', 'GIT_AUTHOR_EMAIL': f'agent-mesh@{HOST}',
+            'GIT_COMMITTER_NAME': 'agent-mesh', 'GIT_COMMITTER_EMAIL': f'agent-mesh@{HOST}'}
+
+
+def git(*args, check=True, timeout=60):
+    r = subprocess.run(['git', '-C', str(REPO), *args], capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, **identity(), 'GIT_SSH_COMMAND': ssh_command(), 'GIT_TERMINAL_PROMPT': '0'})
+    if check and r.returncode:
+        raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def ssh_command():
+    ssh = 'C:/Windows/System32/OpenSSH/ssh.exe' if WINDOWS else 'ssh'
+    return f'{ssh} -o BatchMode=yes -o ConnectTimeout=8'
+
+
+# ---------- memory: every project's memory folder is the shared one ----------
+def is_link(p):
+    return p.is_symlink() or p.is_junction()  # a junction on Windows
+
+
+def make_link(link, target):
+    if WINDOWS:  # a junction needs no admin rights, unlike a symlink
+        subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)], capture_output=True, check=True)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def adopt(folder):
+    """Move a project's own memory files into the shared folder (keeping both on a clash)."""
+    for f in folder.iterdir():
+        if not f.is_file():
+            continue
+        dest = MEMORY / f.name
+        if f.name == 'MEMORY.md':
+            have = (MEMORY / 'MEMORY.md').read_text(encoding='utf-8').splitlines() if (MEMORY / 'MEMORY.md').exists() else []
+            new = [l for l in f.read_text(encoding='utf-8').splitlines() if l.strip() and l not in have]
+            if new:
+                (MEMORY / 'MEMORY.md').write_text('\n'.join(have + new).strip() + '\n', encoding='utf-8')
+            f.unlink()
+            continue
+        if dest.exists() and dest.read_bytes() != f.read_bytes():
+            dest = MEMORY / f'{f.stem}-{HOST}{f.suffix}'
+        shutil.move(str(f), str(dest))
+
+
+def link_memories():
+    projects = CLAUDE / 'projects'
+    if not projects.is_dir():
+        return []
+    linked = []
+    for project in projects.iterdir():
+        if not project.is_dir():
+            continue
+        mem = project / 'memory'
+        if is_link(mem):
+            continue
+        if mem.is_dir():
+            adopt(mem)
+            if any(mem.iterdir()):
+                log(f'left {mem}: it still holds folders')
+                continue
+            mem.rmdir()
+        make_link(mem, MEMORY)
+        linked.append(project.name)
+    return linked
+
+
+# ---------- extra Claude accounts share the main account's config ----------
+def accounts():
+    return sorted(p for p in HOME.glob('.claude-*') if p.is_dir() and not is_link(p)
+                  and p.name[len('.claude-'):].isalnum())
+
+
+def remove_link(p):
+    os.rmdir(p) if WINDOWS and p.is_dir() else p.unlink()  # a junction / dir symlink on Windows
+
+
+@cache
+def symlinks_work():
+    if not WINDOWS:
+        return True
+    probe = REPO / '.git' / 'symlink-probe'
+    try:
+        probe.unlink(missing_ok=True)
+        probe.symlink_to(REPO / 'README.md')
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def backup(path, account):
+    dest = ACCOUNT_BACKUPS / f"{account.name}-{path.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(dest))
+    log(f'kept the older {path} as {dest}')
+
+
+def merge_tree(src, dst):
+    """Move what's in src into dst (sessions and memories are uniquely named; a clash keeps both)."""
+    for item in list(src.iterdir()):
+        target = dst / item.name
+        if is_link(item):
+            remove_link(item)  # e.g. a project's memory link: link_memories makes it in dst
+        elif not target.exists():
+            shutil.move(str(item), str(target))
+        elif item.is_dir() and target.is_dir():
+            merge_tree(item, target)
+        elif item.is_file() and target.is_file() and item.read_bytes() == target.read_bytes():
+            item.unlink()
+        else:
+            shutil.move(str(item), str(dst / f'{item.stem}-{src.parent.name.lstrip(".")}{item.suffix}'))
+    src.rmdir()
+
+
+def fold_file(link, target, account):
+    """A real file where a link belongs (Claude Code may replace a link when it saves, and Windows
+    keeps copies): the newer version becomes the main one, a replaced one goes to .git/account-backups."""
+    if not target.exists():
+        shutil.move(str(link), str(target))
+        return
+    differs = link.read_bytes() != target.read_bytes()
+    if differs and link.stat().st_mtime > target.stat().st_mtime:
+        backup(target, account)
+        shutil.copy2(link, target)
+        differs = False
+    elif differs and symlinks_work():
+        backup(link, account)
+        return
+    if symlinks_work() or differs:  # an in-step Windows copy stays; anything else is relinked
+        link.unlink()
+
+
+def link_accounts():
+    for account in accounts():
+        for name in ACCOUNT_SHARED:
+            link, target = account / name, CLAUDE / name
+            if is_link(link):
+                try:
+                    if os.path.samefile(link, target):
+                        continue
+                except OSError:
+                    pass
+                remove_link(link)  # dangling or pointing elsewhere
+            if link.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                merge_tree(link, target)
+            elif link.is_file():
+                fold_file(link, target, account)
+                if link.exists():
+                    continue
+            if target.is_dir():
+                make_link(link, target)
+            elif target.is_file():
+                if symlinks_work():
+                    link.symlink_to(target)
+                else:
+                    shutil.copy2(target, link)
+
+
+def sync_accounts():
+    try:
+        link_accounts()
+    except OSError as error:
+        log(f'linking extra Claude accounts failed: {error}')
+
+
+# ---------- settings: shared keys sync both ways ----------
+def pick(d, dotted):
+    for part in dotted.split('.'):
+        if not isinstance(d, dict) or part not in d:
+            return None
+        d = d[part]
+    return d
+
+
+def put(d, dotted, value):
+    *parents, last = dotted.split('.')
+    for part in parents:
+        d = d.setdefault(part, {})
+    if value is None:
+        d.pop(last, None)
+    else:
+        d[last] = value
+
+
+def subset(settings):
+    return {k: pick(settings, k) for k in SHARED_KEYS if pick(settings, k) is not None}
+
+
+def read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def capture_settings(state):
+    """Before merging: a shared setting changed on this machine goes into the shared file."""
+    local = subset(read_json(CLAUDE / 'settings.json', {}))
+    if 'settings' in state and local != state['settings']:
+        shared = read_json(SHARED_SETTINGS, {})
+        for k in SHARED_KEYS:
+            if k in local:
+                shared[k] = local[k]
+            elif k in state['settings']:
+                shared.pop(k, None)  # removed here on purpose
+        write_json(SHARED_SETTINGS, shared)
+
+
+def apply_settings(state):
+    """After merging: the shared settings (and this machine's sync hooks) go into settings.json."""
+    path = CLAUDE / 'settings.json'
+    settings = read_json(path, {})
+    before = json.dumps(settings, sort_keys=True)
+    shared = read_json(SHARED_SETTINGS, {})
+    for k in SHARED_KEYS:
+        put(settings, k, shared.get(k))
+    if settings.get('permissions') == {}:
+        settings.pop('permissions')
+    install_hooks(settings)
+    if json.dumps(settings, sort_keys=True) != before:
+        write_json(path, settings)
+    state['settings'] = subset(settings)
+
+
+def python(quiet=False):
+    """This Python; on Windows `quiet` picks pythonw.exe, so nothing flashes a console window."""
+    exe = Path(sys.executable)
+    if WINDOWS:
+        exe = exe.with_name('pythonw.exe' if quiet else 'python.exe')
+    return exe.as_posix()
+
+
+def hook_command():
+    return f'"{python()}" "{(REPO / "bin" / "agent-mesh").as_posix()}" sync --background'
+
+
+def install_hooks(settings):
+    hooks = settings.setdefault('hooks', {})
+    for event in ('SessionStart', 'Stop'):
+        entries = [e for e in hooks.get(event, []) if 'agent-mesh' not in json.dumps(e)]
+        entries.append({'hooks': [{'type': 'command', 'command': hook_command(), 'timeout': 10}]})
+        hooks[event] = entries
+
+
+# ---------- instructions ----------
+def ensure_claude_md():
+    path = CLAUDE / 'CLAUDE.md'
+    text = path.read_text(encoding='utf-8') if path.exists() else ''
+    if IMPORT_LINE not in text:
+        head = ('# Shared by every machine: edit ~/.agent-mesh/AGENTS.md, not this file.\n'
+                f'{IMPORT_LINE}\n')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(head + ('\n# Only this machine\n' + text if text.strip() else ''), encoding='utf-8')
+
+
+def write_codex():
+    if not CODEX.is_dir():
+        return
+    # Codex can't load memory on demand like Claude Code, so its copy has every shared memory inline.
+    memories, size = [], 0
+    for f in sorted(MEMORY.glob('*.md'), key=lambda f: f.stat().st_mtime, reverse=True):
+        if f.name == 'MEMORY.md':
+            continue
+        text = f.read_text(encoding='utf-8').strip()
+        if size + len(text) > MEMORY_INLINE:
+            memories.append(f'### {f.name}\n\n(too long to include here: read ~/.agent-mesh/memory/{f.name})')
+            continue
+        memories.append(f'### {f.name}\n\n{text}')
+        size += len(text)
+    body = ('<!-- Written by agent-mesh from ~/.agent-mesh/AGENTS.md and the shared memory.\n'
+            '     Edit those instead: this copy is replaced on every sync. -->\n\n'
+            + (REPO / 'AGENTS.md').read_text(encoding='utf-8')
+            + '\n\n## Shared memory (the same memory Claude Code uses; files are in ~/.agent-mesh/memory/)\n\n'
+            + ('\n\n'.join(memories) or '(none yet)') + '\n')
+    agents = CODEX / 'AGENTS.md'
+    if not agents.exists() or agents.read_text(encoding='utf-8') != body:
+        agents.write_text(body, encoding='utf-8')
+    # Top-level Codex settings worth sharing; the rest of config.toml is machine-specific.
+    shared = {}
+    if SHARED_CODEX.exists():
+        for line in SHARED_CODEX.read_text(encoding='utf-8').splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key.strip() in CODEX_KEYS:
+                shared[key.strip()] = value.strip()
+    config = CODEX / 'config.toml'
+    if shared and config.exists():
+        lines = config.read_text(encoding='utf-8').splitlines()
+        first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith('[')), len(lines))
+        top = {l.partition('=')[0].strip(): i for i, l in enumerate(lines[:first_table]) if '=' in l}
+        changed, added = False, 0
+        for key, value in shared.items():
+            line = f'{key} = {value}'
+            if key in top:
+                if lines[top[key]] != line:
+                    lines[top[key]], changed = line, True
+            else:  # new keys go first, in the shared file's order
+                lines.insert(added, line)
+                top = {k: i + 1 if i >= added else i for k, i in top.items()}
+                added += 1
+                changed = True
+        if changed:
+            config.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    wrap_codex_notify()
+
+
+def wrap_codex_notify():
+    """Codex runs its `notify` command after every turn: point it at `agent-mesh codex-notify`, which
+    syncs and then runs whatever notify was there before (a plugin's, for example)."""
+    config = CODEX / 'config.toml'
+    if not config.exists():
+        return
+    lines = config.read_text(encoding='utf-8').splitlines()
+    first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith('[')), len(lines))
+    start = next((i for i in range(first_table) if lines[i].partition('=')[0].strip() == 'notify'), None)
+    old, end = [], start
+    if start is not None:
+        while ']' not in lines[end] and end + 1 < first_table:
+            end += 1
+        try:
+            old = tomllib.loads('\n'.join(lines[start:end + 1]))['notify']
+        except (tomllib.TOMLDecodeError, KeyError):
+            log('codex notify left alone: it could not be read')
+            return
+    if 'codex-notify' in old:  # ours already: keep what it chains to, refresh our own paths
+        old = old[old.index('--then') + 1:] if '--then' in old else []
+    ours = [python(quiet=True), (REPO / 'bin' / 'agent-mesh').as_posix(), 'codex-notify', *(['--then', *old] if old else [])]
+    line = 'notify = ' + json.dumps(ours)  # a JSON list of strings is valid TOML
+    if start is None:
+        lines.insert(0, line)
+    elif lines[start:end + 1] == [line]:
+        return
+    else:
+        lines[start:end + 1] = [line]
+    config.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def codex_notify(args):
+    """Codex's after-turn hook: sync in the background, then hand Codex's arguments (the event JSON is
+    the last one) to the notify command that was configured before agent-mesh."""
+    detach([sys.executable, str(Path(__file__).resolve()), 'sync'])
+    if '--then' in args and args[args.index('--then') + 1:]:
+        detach(args[args.index('--then') + 1:])
+
+
+# ---------- sync ----------
+def locked():
+    try:
+        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        if time.time() - LOCK.stat().st_mtime > 120:  # a crashed sync
+            LOCK.unlink(missing_ok=True)
+            return locked()
+        return False
+
+
+def sync():
+    if not locked():
+        return 'another sync is running'
+    try:
+        state = read_json(STATE, {})
+        sync_accounts()  # first, so what an extra account changed is in ~/.claude before capturing
+        linked = link_memories()
+        capture_settings(state)
+        git('add', '-A')
+        if git('diff', '--cached', '--quiet', check=False).returncode:
+            git('commit', '-q', '-m', f'{HOST}: ' + (f"link memory of {', '.join(linked)}" if linked else 'sync'))
+        remote = bool(git('remote', check=False).stdout.strip())
+        if remote and git('rev-parse', '--abbrev-ref', '@{u}', check=False).returncode:
+            track_origin()
+        pulled = git('pull', '-q', '--no-rebase', '--no-edit', check=False, timeout=60) if remote else None
+        if pulled and pulled.returncode:
+            if (REPO / '.git' / 'MERGE_HEAD').exists():
+                git('merge', '--abort', check=False)
+            raise RuntimeError('pull failed (kept this machine as it was): ' + (pulled.stderr or pulled.stdout).strip()[:300])
+        if remote and git('rev-list', '--count', '@{u}..HEAD', check=False).stdout.strip() not in ('', '0'):
+            git('push', '-q', timeout=60)
+        apply_settings(state)
+        ensure_claude_md()
+        write_codex()
+        sync_accounts()  # again, to refresh Windows copies with what was just applied
+        write_json(STATE, state)
+        return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
+    finally:
+        LOCK.unlink(missing_ok=True)
+
+
+def track_origin():
+    """A new mesh's first push, or a clone whose branch doesn't track origin yet."""
+    branch = git('branch', '--show-current').stdout.strip() or 'main'
+    git('fetch', '-q', 'origin', check=False, timeout=60)
+    if git('rev-parse', '--verify', '-q', f'origin/{branch}', check=False).returncode:
+        git('push', '-q', '-u', 'origin', branch, timeout=60)
+    else:
+        git('branch', '-q', f'--set-upstream-to=origin/{branch}')
+
+
+# ---------- init, timer ----------
+AGENTS_TEMPLATE = """# Shared instructions for every agent on my machines
+
+This file is shared by Claude Code and Codex on all my machines through agent-mesh. Claude Code imports
+it from `~/.claude/CLAUDE.md`; Codex gets a copy as `~/.codex/AGENTS.md`. **Edit it in the mesh
+(`{mesh}/AGENTS.md`), never in those copies.** Other machines get a change on their next sync.
+
+## About me
+- (Who you are, how you like to work, standing permissions such as pushing without asking.)
+
+## One brain across machines and agents
+- **Memory is shared.** Claude Code's memory folder for every project on every machine is linked to
+  `{mesh}/memory/` (index: `MEMORY.md`); Codex gets all of it in its AGENTS.md. Save what would help on
+  another machine, in another project or to the other agent, in the usual memory format (a file plus one
+  index line); machine-specific facts say which machine they're about.
+- **Codex: write to `{mesh}/memory/`, not your built-in memory.** Claude Code can't see Codex's own memory.
+- **Before you finish a task, leave a handover** in memory if work is unfinished: what was done, where
+  (machine, folder, branch, commit), what's left. Then run `agent-mesh sync`.
+- **Starting a task that continues recent work:** run `agent-mesh sync` first, then read the memory files
+  that matter.
+
+## My machines
+| Name | What it is | How to reach it |
+| --- | --- | --- |
+| (e.g. desktop) | (e.g. Arch Linux, Hyprland) | (e.g. `ssh desktop`) |
+
+## What lives where
+- (Projects, where their source of truth is, how to deploy or restart them.)
+"""
+
+
+def init(args):
+    if (REPO / 'AGENTS.md').exists():
+        sys.exit(f'{REPO} is already a mesh. On another machine, clone your mesh there and run `agent-mesh setup`.')
+    REPO.mkdir(parents=True, exist_ok=True)
+    (REPO / 'bin').mkdir(exist_ok=True)
+    MEMORY.mkdir(exist_ok=True)
+    shown = '~/' + REPO.relative_to(HOME).as_posix() if REPO.is_relative_to(HOME) else REPO.as_posix()
+    (REPO / 'AGENTS.md').write_text(AGENTS_TEMPLATE.format(mesh=shown), encoding='utf-8')
+    (MEMORY / 'MEMORY.md').write_text('', encoding='utf-8')
+    # Start from this machine's settings, so the first sync doesn't take away what you already set.
+    write_json(SHARED_SETTINGS, subset(read_json(CLAUDE / 'settings.json', {})))
+    codex = (CODEX / 'config.toml').read_text(encoding='utf-8').splitlines() if (CODEX / 'config.toml').exists() else []
+    first_table = next((i for i, l in enumerate(codex) if l.lstrip().startswith('[')), len(codex))
+    keep = [l for l in codex[:first_table] if l.partition('=')[0].strip() in CODEX_KEYS]
+    SHARED_CODEX.parent.mkdir(exist_ok=True)
+    SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
+                            + ''.join(l + '\n' for l in keep), encoding='utf-8')
+    shutil.copy2(TOOL, REPO / 'bin' / 'agent-mesh')
+    (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
+    (REPO / '.gitignore').write_text('__pycache__/\n*.pyc\n', encoding='utf-8')
+    readme = TEMPLATE / 'README.md'
+    if readme.exists():
+        shutil.copy2(readme, REPO / 'README.md')
+    if not (REPO / '.git').exists():
+        subprocess.run(['git', 'init', '-q', '-b', 'main', str(REPO)], check=True)
+    git('add', '-A')
+    git('commit', '-q', '-m', f'{HOST}: new agent mesh')
+    if '--origin' in args:
+        git('remote', 'add', 'origin', args[args.index('--origin') + 1])
+    print(f'Made a new mesh in {REPO}. Edit {REPO / "AGENTS.md"}: it is now every agent\'s instructions.')
+    print(f'Sync: {sync()}')
+    link_command()
+
+
+def link_command():
+    """~/.local/bin/agent-mesh -> the mesh's own copy (Linux/macOS), if nothing is there yet."""
+    if WINDOWS:
+        return
+    command = HOME / '.local' / 'bin' / 'agent-mesh'
+    if not command.exists() and not command.is_symlink():
+        command.parent.mkdir(parents=True, exist_ok=True)
+        command.symlink_to(REPO / 'bin' / 'agent-mesh')
+        print(f'Linked {command}')
+
+
+def timer():
+    script = (REPO / 'bin' / 'agent-mesh').as_posix()
+    if WINDOWS:
+        task = f'"{python(quiet=True)}" "{script}" sync'
+        r = subprocess.run(['schtasks', '/create', '/f', '/tn', 'agent-mesh sync', '/sc', 'minute', '/mo', '10', '/tr', task],
+                           capture_output=True, text=True)
+        print((r.stdout or r.stderr).strip())
+        return
+    if not shutil.which('systemctl'):
+        sys.exit('No systemd here: run `agent-mesh sync` every 10 minutes from cron or launchd instead.')
+    units = HOME / '.config' / 'systemd' / 'user'
+    units.mkdir(parents=True, exist_ok=True)
+    (units / 'agent-mesh.service').write_text(
+        f'[Unit]\nDescription=Sync the agent mesh\n\n[Service]\nType=oneshot\nExecStart={python()} {script} sync\n')
+    (units / 'agent-mesh.timer').write_text(
+        '[Unit]\nDescription=Sync the agent mesh every 10 minutes\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=10min\n\n'
+        '[Install]\nWantedBy=timers.target\n')
+    subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
+    subprocess.run(['systemctl', '--user', 'enable', '--now', 'agent-mesh.timer'], check=True)
+    print('agent-mesh.timer: syncing every 10 minutes')
+
+
+def background():
+    detach([sys.executable, str(Path(__file__).resolve()), 'sync'])
+
+
+def detach(args):
+    """Start a command that outlives this one, with no window and no inherited pipes."""
+    if WINDOWS:
+        flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+        subprocess.Popen(args, creationflags=flags, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    else:
+        subprocess.Popen(args, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def status():
+    origin = git('remote', 'get-url', 'origin', check=False).stdout.strip() or '(none)'
+    print(f'mesh: {REPO}  origin: {origin}')
+    git('fetch', '-q', check=False)
+    print('this machine:', git('status', '-sb', '--porcelain', check=False).stdout.splitlines()[0])
+    print('last commits:\n  ' + '\n  '.join(git('log', '-5', '--format=%h %ar %s', check=False).stdout.splitlines()))
+    projects = CLAUDE / 'projects'
+    for p in sorted(projects.iterdir()) if projects.is_dir() else []:
+        mem = p / 'memory'
+        print(f"  memory {'linked ' if is_link(mem) else 'NOT linked'}  {p.name}")
+    md = CLAUDE / 'CLAUDE.md'
+    print('CLAUDE.md imports AGENTS.md:', md.exists() and IMPORT_LINE in md.read_text(encoding='utf-8'))
+    for account in accounts():
+        bad = [n for n in ACCOUNT_SHARED if (CLAUDE / n).exists() and not (
+            is_link(account / n) or (account / n).is_file() and (account / n).read_bytes() == (CLAUDE / n).read_bytes())]
+        print(f"account {account.name}: {'shares ~/.claude' if not bad else 'NOT shared: ' + ', '.join(bad)}")
+    print('Codex AGENTS.md written:', (CODEX / 'AGENTS.md').exists() if CODEX.is_dir() else 'no Codex here')
+    print('memories:', len([f for f in MEMORY.glob('*.md') if f.name != 'MEMORY.md']))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+    elif args[0] == 'init':
+        init(args[1:])
+    elif args[0] == 'timer':
+        timer()
+    elif args[0] in ('setup', 'sync'):
+        if args[0] == 'setup' and not (REPO / 'AGENTS.md').exists():
+            sys.exit(f'No mesh in {REPO}: run `agent-mesh init` (first machine) or clone yours there.')
+        if args[0] == 'setup':
+            link_command()
+        if '--background' in args:
+            background()
+            return
+        try:
+            log(f'{args[0]}: {sync()}')
+        except Exception as error:
+            log(f'{args[0]} failed: {error}')
+            sys.exit(1)
+    elif args[0] == 'status':
+        status()
+    elif args[0] == 'codex-notify':
+        codex_notify(args[1:])
+    else:
+        sys.exit('agent-mesh: unknown command (try `agent-mesh help`)')
+
+
+if __name__ == '__main__':
+    main()
