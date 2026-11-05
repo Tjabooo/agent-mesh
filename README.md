@@ -16,9 +16,10 @@ or a bare repo on one of your machines.
 | `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules, `enableArtifact`, `disableClaudeAiConnectors`, `skillOverrides`). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
 | `codex/config.toml` | Top-level Codex settings to share (`model`, `model_reasoning_effort`). |
 | `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
+| `bin/agent_mesh_sessions.py` | Copies the other machines’ Claude Code and Codex sessions here, so you can resume a chat on any machine (see below). |
 | `bin/cost` | `cost`: what all your Claude Code and Codex chats would have cost at API prices, across every machine (see below). |
 | `bin/token-audit` | `token-audit`: where the tokens go: fixed per-session overhead, cache breaks, biggest tool results, re-reads, images, subagents (see below). |
-| `hosts.json` (optional) | Your machines, for `cost` and `token-audit` (copy `hosts.example.json`). |
+| `hosts.json` (optional) | Your machines, for session sharing, `cost` and `token-audit` (copy `hosts.example.json`). |
 
 Logins, caches and plugins are never shared. Conversation text can optionally be exported to a
 separate private GitHub repository for ChatGPT; this is disabled until configured.
@@ -50,6 +51,27 @@ its current exported files, while previous Git commits retain old versions.
 `agent-mesh status` reports counts and the last export result. If GitHub is unavailable, local
 mesh sync still completes and the archive retries next time. Export checkouts and incremental
 caches stay under the mesh's `.git/` directory. To stop publishing, set `enabled` to `false`.
+
+## Resume a chat on another machine
+
+Every sync also copies the other machines' Claude Code and Codex sessions to this one
+(`~/.claude/projects/**` and `~/.codex/sessions/**`, plus Codex's thread names). So a chat you ran
+on the laptop shows up in `claude --resume` or `codex resume` on the desktop, and you carry on there.
+`agent-mesh sessions` does it right away. Automatic pulls run at most every 2 minutes, because the
+hooks sync after every reply.
+
+- Each machine pulls from its peers in `hosts.json` (falling back to `~/.config/cost/hosts.json` or
+  `~/.config/archfleet/hosts.json`) over SSH. Peers need only `ssh`, `tar` and `python3`.
+  A sleeping machine is skipped and tried again next time.
+- Only machines with the same OS share sessions. A session remembers its working folder, and a
+  Windows path means nothing on Linux. Claude Code lists a session under its folder, so resume from
+  the same folder (`~` → `~`); it needs the same path on both machines.
+- Sessions are append-only JSONL. A file is copied when it's missing here, and grown when the peer's
+  copy is longer and starts with exactly what's here. Only whole lines are copied, so a chat that's
+  still being written is never cut mid-line. A chat continued on two machines at once has diverged:
+  it's left alone on both and logged in `.git/agent-mesh.log`.
+- Copied bytes are listed in `~/.local/state/agent-mesh/foreign-sessions.json`. `cost`,
+  `token-audit` and the ChatGPT export skip them, so each chat is counted on the machine that ran it.
 
 ## When it syncs
 

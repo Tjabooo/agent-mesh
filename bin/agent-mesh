@@ -9,6 +9,8 @@ your machines, kept in step through a git repo you own (the "mesh", ~/.agent-mes
   agent-mesh sync --background   the same, detached (what the Claude Code hooks run)
   agent-mesh timer        also sync every 10 minutes (systemd user timer / Windows scheduled task)
   agent-mesh status       what is linked and whether this machine is in step
+  agent-mesh sessions     copy the other machines' Claude Code and Codex sessions here now (sync does it
+                          too, at most every 2 minutes), so `claude --resume` / `codex resume` list them
   agent-mesh export-chatgpt    publish opted-in conversations and memory to a private GitHub repo
   agent-mesh codex-notify [--then CMD...]   Codex's after-turn `notify` (set up by sync): syncs,
                           then runs the notify command that was there before
@@ -485,10 +487,24 @@ def sync():
         write_codex()
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
+        share_sessions()
         export_chatgpt()
         return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
     finally:
         LOCK.unlink(missing_ok=True)
+
+
+def share_sessions(force=False):
+    """Pull the other machines' chat sessions; a sleeping peer is skipped and tried next time."""
+    try:
+        from agent_mesh_sessions import share
+        result = share(REPO, log, force=force)
+        if result:
+            log(f'sessions: {result}')
+        return result
+    except Exception as error:
+        log(f'sessions failed (mesh sync completed): {error}')
+        return False
 
 
 def export_chatgpt():
@@ -569,7 +585,7 @@ def init(args):
     SHARED_CODEX.parent.mkdir(exist_ok=True)
     SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
                             + ''.join(l + '\n' for l in keep), encoding='utf-8')
-    for tool in ('agent-mesh', 'agent_mesh_export.py', 'cost'):  # the tools travel with the mesh
+    for tool in ('agent-mesh', 'agent_mesh_export.py', 'agent_mesh_sessions.py', 'cost'):  # the tools travel with the mesh
         if (TOOL.parent / tool).exists():
             shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
@@ -683,6 +699,14 @@ def main():
         status()
     elif args[0] == 'codex-notify':
         codex_notify(args[1:])
+    elif args[0] == 'sessions':
+        if not locked():
+            sys.exit('another sync is running; try again in a moment')
+        try:
+            if share_sessions(force=True) is False:
+                sys.exit(1)
+        finally:
+            LOCK.unlink(missing_ok=True)
     elif args[0] == 'export-chatgpt':
         if not locked():
             sys.exit('another sync is running; the export will run with it')

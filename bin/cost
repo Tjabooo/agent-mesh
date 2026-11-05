@@ -112,15 +112,41 @@ class Rows:
                 for (t, m, d, s), v in self.d.items()]
 
 
+# Sessions copied in from another machine by `agent-mesh sessions` are counted there, not here:
+# the ledger lists, per file under the home, the byte ranges that came from elsewhere.
+def _foreign():
+    try:
+        return json.loads((Path.home() / '.local/state/agent-mesh/foreign-sessions.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+FOREIGN = _foreign()
+
+
+def own_lines(path):
+    """The file's lines (as text) that were written on this machine."""
+    try:
+        rel = Path(path).resolve().relative_to(Path.home().resolve()).as_posix()
+    except ValueError:
+        rel = ''
+    skip = FOREIGN.get(rel) or ()
+    with open(path, 'rb') as f:
+        pos = 0
+        for raw in f:
+            start, pos = pos, pos + len(raw)
+            if not any(a <= start < b for a, b in skip):
+                yield raw.decode('utf-8', errors='replace')
+
+
 def jsonl(path, needles):
     try:
-        with open(path, encoding='utf-8', errors='replace') as f:
-            for line in f:
-                if any(n in line for n in needles):
-                    try:
-                        yield json.loads(line)
-                    except ValueError:
-                        pass
+        for line in own_lines(path):
+            if any(n in line for n in needles):
+                try:
+                    yield json.loads(line)
+                except ValueError:
+                    pass
     except OSError:
         return
 
