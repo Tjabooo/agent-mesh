@@ -16,6 +16,8 @@ or a bare repo on one of your machines.
 | `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
 | `codex/config.toml` | Top-level Codex settings to share (`model`, `model_reasoning_effort`). |
 | `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
+| `bin/cost` | `cost`: what all your Claude Code and Codex chats would have cost at API prices, across every machine (see below). |
+| `hosts.json` (optional) | Your machines, for `cost` (copy `hosts.example.json`). |
 
 Logins, caches and plugins are never shared. Conversation text can optionally be exported to a
 separate private GitHub repository for ChatGPT; this is disabled until configured.
@@ -61,6 +63,67 @@ result. Markdown merges line by line (`merge=union`), so two machines saving mem
 time both keep theirs. If a merge still fails, the machine is left as it was and the failure is
 logged in `.git/agent-mesh.log`.
 
+## What your agents cost
+
+`cost` adds up every Claude Code and Codex conversation on all your machines and prices each API
+call at the published per-token rates: the same idea as the "cost" line in Claude Code's `/usage`,
+but for both agents and every computer at once. On a subscription (Claude Pro/Max, ChatGPT Plus)
+nothing is billed per token, so read it as "what this would have cost on the API".
+
+```
+ AI spend · API-equivalent · 3 machines                         2026-11-05 13:12
+ ────────────────────────────────────────────────────────────────
+ Total                        $629.14   since 2026-10-31 · 6 days · $104.86/day
+ Today               $121.48
+ Last 7 days         $629.14
+
+ By agent
+   Claude Code             $566.03    90%  ██████████████████
+   Codex                    $63.10    10%  ██
+
+ By machine
+   desktop                 $318.13    51%  ██████████████████
+   laptop                  $247.25    39%  █████████████▌
+   server                   $63.75    10%  ███▌
+
+ By model               calls    input  cache rd   output       cost
+   claude-opus-5-5         6.7k    16.9M      1.5B     6.4M    $565.13
+   gpt-6.1-sol             1.6k     5.4M    242.1M     1.2M     $57.19
+
+ Cache    99% of input read from cache · saved $6,373.65 (would be $7,002.79 uncached)
+ Activity 107 sessions · 8.4k API calls · 6 active days · $5.88/session
+```
+
+It also lists the priciest sessions (by their titles) and a bar per day.
+
+```sh
+cost                  # all machines, all time
+cost -d 7             # last 7 days (or --since 2026-11-01)
+cost --local          # only this machine
+cost --top 10         # the 10 priciest sessions
+cost --daily          # every day, not just the last 14
+cost --json           # the raw numbers
+```
+
+How it works: it reads the transcripts the agents already keep (`~/.claude/projects/**/*.jsonl`,
+including subagents, and `~/.codex/sessions/**/*.jsonl`), takes the token usage of each API call
+(counting a message only once when a transcript is forked or resumed), and prices it with the table
+at the top of `bin/cost`: input, output, cache writes (5-minute and 1-hour) and cache reads, fast
+mode, and long-prompt rates. The Claude prices match the `costUSD` Claude Code records itself. A
+model it doesn't know yet shows "no price" until you add it to the table.
+
+Other machines are read over SSH: `cost` pipes itself to their Python, so they need nothing
+installed, only an SSH alias that works without a password. List them in `hosts.json` in the mesh
+(or point `COST_HOSTS_FILE` somewhere else):
+
+```json
+[{"alias": "desktop", "hostname": "desktop", "os": "linux"},
+ {"alias": "server", "hostname": "server", "os": "windows"}]
+```
+
+The machine you run it on is recognised by its hostname and read directly. A machine that doesn't
+answer (asleep, offline) is reported as "not counted" instead of quietly left out.
+
 ## Set up
 
 Requirements: Python 3.12+ and git on each machine. Your git remote must be reachable without a
@@ -91,7 +154,8 @@ agent-mesh timer
 On Windows, use `python` instead of `python3`, and `python %USERPROFILE%\.agent-mesh\bin\agent-mesh`
 instead of `agent-mesh`. `timer` creates a Task Scheduler task there.
 
-On Linux/macOS, `~/.local/bin/agent-mesh` is linked to the mesh's copy. To keep the mesh somewhere
+On Linux/macOS, `~/.local/bin/agent-mesh` and `~/.local/bin/cost` are linked to the mesh's copies
+(on Windows, run `python %USERPROFILE%\.agent-mesh\bin\cost`). To keep the mesh somewhere
 other than `~/.agent-mesh`, set `AGENT_MESH_DIR`.
 
 ### A bare repo on your own machine instead of GitHub

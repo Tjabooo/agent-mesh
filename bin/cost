@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""cost: what your Claude Code and Codex chats would have cost at API prices, across machines.
+
+Reads the transcripts the two CLIs already keep (~/.claude/projects/**/*.jsonl and
+~/.codex/sessions/**/*.jsonl), prices every API call with the published per-token rates and
+adds them up. Other machines are scanned over SSH: this script is piped to their Python, so
+nothing has to be installed there.
+
+  cost                  all machines, everything
+  cost -d 7             last 7 days          cost --since 2026-11-01
+  cost --local          this machine only    cost --daily      one line per day
+  cost --top 10         priciest sessions    cost --json       raw numbers
+
+Machines come from the first of $COST_HOSTS_FILE, hosts.json in the mesh, ~/.config/cost/hosts.json
+or ~/.config/archfleet/hosts.json: a JSON list of {"alias": ssh alias, "hostname": name,
+"os": "linux"|"windows"} (see hosts.example.json). This machine is skipped by its hostname.
+Subscription plans (Pro/Max, ChatGPT Plus) don't bill per token: the figure is what the same
+usage would cost on the API, like the "cost" line in Claude Code's /usage.
+"""
+import argparse
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import zlib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+M = 1e6
+# Claude: $/MTok. in, out, cache read; cache writes are 1.25x (5 min) / 2x (1 h) input.
+# Checked against the costUSD Claude Code itself records for Opus 5.5 and Haiku 5.5.
+CLAUDE = {
+    'claude-fable-5-1': (10, 50, 0.25), 'claude-mythos-5-1': (10, 50, 0.25),
+    'claude-fable-5': (10, 50, 1.0),
+    'claude-opus-5-5': (4, 20, 0.20), 'claude-opus-5': (5, 25, 0.50),
+    'claude-opus-4-8': (5, 25, 0.50), 'claude-opus-4-7': (5, 25, 0.50), 'claude-opus-4-6': (5, 25, 0.50),
+    'claude-sonnet-5-5': (2, 10, 0.20), 'claude-sonnet-5': (2, 10, 0.20), 'claude-sonnet-4-6': (3, 15, 0.30),
+    'claude-haiku-5-5': (0.10, 0.50, 0.01), 'claude-haiku-4-5': (1, 5, 0.10),
+}
+HAIKU_LONG = 100_000            # Haiku 5.5 prompts above this cost 5x
+FAST = {'claude-opus-5-5': 2, 'claude-opus-5': 2, 'claude-opus-4-8': 2}  # fast mode multiplier
+# Codex (OpenAI): in, cached in, out. Requests over 272K input: 2x input/cached, 1.5x output.
+CODEX = {
+    'gpt-6-astra': (10, 1.0, 50), 'gpt-6.1-sol': (2, 0.10, 10),
+    'gpt-6.1-terra': (None, None, None), 'gpt-6-luna': (0.10, 0.01, 0.50),
+}
+OPENAI_LONG = 272_000
+
+
+def claude_price(model, u, speed):
+    p = CLAUDE.get(model) or CLAUDE.get(model.split('[')[0])
+    if not p:
+        return None, 0.0
+    pin, pout, pread = p
+    cc = u.get('cache_creation') or {}
+    w1h = cc.get('ephemeral_1h_input_tokens', 0) or 0
+    w5m = cc.get('ephemeral_5m_input_tokens', 0) or 0
+    if not cc:
+        w5m = u.get('cache_creation_input_tokens', 0) or 0
+    inp, read, out = u.get('input_tokens', 0) or 0, u.get('cache_read_input_tokens', 0) or 0, u.get('output_tokens', 0) or 0
+    mult = FAST.get(model, 1) if speed == 'fast' else 1
+    if model.startswith('claude-haiku-5-5') and inp + w1h + w5m + read > HAIKU_LONG:
+        mult *= 5
+    cost = (inp * pin + w5m * pin * 1.25 + w1h * pin * 2 + read * pread + out * pout) * mult / M
+    return cost, read * (pin - pread) * mult / M
+
+
+def codex_price(model, u, tier):
+    p = CODEX.get(model)
+    if not p or p[0] is None:
+        return None, 0.0
+    pin, pcache, pout = p
+    inp, cached, out = u.get('input_tokens', 0) or 0, u.get('cached_input_tokens', 0) or 0, u.get('output_tokens', 0) or 0
+    min_, mout = (2, 1.5) if inp > OPENAI_LONG else (1, 1)
+    fast = 2 if tier in ('priority', 'fast') else 1
+    cost = ((inp - cached) * pin * min_ + cached * pcache * min_ + out * pout * mout) * fast / M
+    return cost, cached * (pin - pcache) * min_ * fast / M
+
+
+def local_day(ts):
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone().date().isoformat()
+    except (ValueError, AttributeError):
+        return '?'
+
+
+class Rows:
+    """Calls summed per (tool, model, day, session)."""
+    FIELDS = ('calls', 'input', 'cache_write', 'cache_read', 'output', 'reasoning', 'cost', 'saved')
+
+    def __init__(self):
+        self.d = defaultdict(lambda: dict.fromkeys(self.FIELDS, 0))
+        self.titles = {}
+
+    def add(self, tool, model, day, session, cost, saved, **tok):
+        r = self.d[(tool, model, day, session)]
+        r['calls'] += 1
+        r['cost'] += cost or 0
+        r['saved'] += saved or 0
+        if cost is None:
+            r['unpriced'] = 1
+        for k, v in tok.items():
+            r[k] += v or 0
+
+    def out(self):
+        return [dict(tool=t, model=m, day=d, session=s, title=self.titles.get(s, ''), **v)
+                for (t, m, d, s), v in self.d.items()]
+
+
+def jsonl(path, needles):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if any(n in line for n in needles):
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        pass
+    except OSError:
+        return
+
+
+def scan_claude(rows, seen):
+    roots = {p.resolve() for p in (Path.home() / '.claude' / 'projects', Path.home() / '.claude-2' / 'projects') if p.is_dir()}
+    files = {f.resolve() for r in roots for f in r.rglob('*.jsonl')}
+    for f in sorted(files):
+        # subagent transcripts live in <session>/subagents/; count them under the parent session
+        session = f.parent.parent.name if f.parent.name == 'subagents' else f.stem
+        msgs = {}
+        for d in jsonl(f, ('"usage"', '"ai-title"')):
+            if d.get('type') == 'ai-title':
+                rows.titles[d.get('sessionId') or session] = d.get('aiTitle', '')
+                continue
+            m = d.get('message')
+            if d.get('type') != 'assistant' or not isinstance(m, dict) or not m.get('usage'):
+                continue
+            key = m.get('id') or d.get('requestId') or d.get('uuid')
+            msgs[key] = d   # later lines of one message carry the final usage
+        for key, d in msgs.items():
+            if key in seen:
+                continue  # copied into a forked/resumed transcript
+            seen.add(key)
+            m, u = d['message'], d['message']['usage']
+            model = m.get('model') or '?'
+            if model == '<synthetic>':
+                continue
+            cost, saved = claude_price(model, u, u.get('speed'))
+            od = u.get('output_tokens_details') or {}
+            rows.add('claude', model, local_day(d.get('timestamp')), session, cost, saved,
+                     input=u.get('input_tokens'), cache_write=u.get('cache_creation_input_tokens'),
+                     cache_read=u.get('cache_read_input_tokens'), output=u.get('output_tokens'),
+                     reasoning=od.get('thinking_tokens'))
+
+
+def scan_codex(rows, seen):
+    home = Path.home() / '.codex'
+    try:
+        for line in open(home / 'session_index.jsonl', encoding='utf-8', errors='replace'):
+            try:
+                d = json.loads(line)
+                rows.titles[d['id']] = d.get('thread_name', '')
+            except (ValueError, KeyError):
+                pass
+    except OSError:
+        pass
+    files = [f for sub in ('sessions', 'archived_sessions') if (home / sub).is_dir() for f in (home / sub).rglob('*.jsonl')]
+    for f in sorted(files):
+        turn_model, model, tier, session, have_records, last_total = {}, '?', None, f.stem[-36:], False, None
+        pending = []
+        for d in jsonl(f, ('turn_context', 'token_usage_record', 'token_count', 'session_meta')):
+            t, p = d.get('type'), d.get('payload') or {}
+            if t == 'session_meta':
+                session = p.get('id') or session
+            elif t == 'turn_context':
+                model = p.get('model') or model
+                tier = p.get('service_tier') or tier
+                if p.get('turn_id'):
+                    turn_model[p['turn_id']] = (model, tier)
+            elif t == 'token_usage_record':
+                have_records = True
+                rid = p.get('response_id')
+                if rid and rid in seen:
+                    continue
+                seen.add(rid)
+                pending.append((p.get('turn_id'), p.get('usage') or {}, d.get('timestamp'), p.get('session_id') or session))
+            elif t == 'event_msg' and p.get('type') == 'token_count' and not have_records:
+                info = p.get('info') or {}
+                total = json.dumps(info.get('total_token_usage'), sort_keys=True)
+                if info.get('last_token_usage') and total != last_total:  # older Codex: no per-response records
+                    last_total = total
+                    pending.append((None, info['last_token_usage'], d.get('timestamp'), session, model, tier))
+        for item in pending:
+            if have_records and len(item) == 6:
+                continue
+            turn, u, ts, sess = item[:4]
+            m, tr = item[4:6] if len(item) == 6 else turn_model.get(turn, (model, tier))
+            if not (u.get('input_tokens') or u.get('output_tokens')):
+                continue
+            cost, saved = codex_price(m, u, tr)
+            cached = u.get('cached_input_tokens') or 0
+            rows.add('codex', m, local_day(ts), sess, cost, saved,
+                     input=(u.get('input_tokens') or 0) - cached, cache_read=cached,
+                     cache_write=u.get('cache_write_input_tokens'), output=u.get('output_tokens'),
+                     reasoning=u.get('reasoning_output_tokens'))
+
+
+def scan():
+    rows = Rows()
+    scan_claude(rows, set())
+    scan_codex(rows, set())
+    return rows.out()
+
+
+# ---------------------------------------------------------------- machines
+
+def hosts():
+    mesh = Path(__file__).resolve().parent.parent / 'hosts.json'
+    for p in (os.environ.get('COST_HOSTS_FILE'), mesh, '~/.config/cost/hosts.json', '~/.config/archfleet/hosts.json'):
+        if p and Path(p).expanduser().is_file():
+            try:
+                return json.loads(Path(p).expanduser().read_text())
+            except ValueError:
+                pass
+    return []
+
+
+def is_me(h):
+    me = socket.gethostname().split('.')[0].lower()
+    return me in {str(h.get(k, '')).lower() for k in ('hostname', 'alias', 'label')}
+
+
+def remote(h):
+    ssh = r'C:\Windows\System32\OpenSSH\ssh.exe' if os.name == 'nt' else 'ssh'
+    py = 'python' if h.get('os') == 'windows' else 'python3'
+    name = h.get('hostname') or h['alias']
+    src = Path(__file__).read_bytes()
+    if os.name == 'nt':
+        # Windows OpenSSH never closes the remote's stdin when fed from a pipe, so send the
+        # script inside the command line instead (compressed to stay under cmd.exe's 8K limit)
+        packed = base64.b64encode(zlib.compress(src, 9)).decode()
+        cmd, src = f'{py} -c "import zlib,base64;exec(zlib.decompress(base64.b64decode(\'{packed}\')))" --scan', None
+    else:
+        cmd = f'{py} - --scan'
+    try:
+        r = subprocess.run([ssh, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', '-o', 'LogLevel=ERROR',
+                            h['alias'], cmd], input=src, stdin=None if src else subprocess.DEVNULL,
+                           capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return name, [], 'timed out'
+    except OSError as e:
+        return name, [], f'ssh failed: {e}'
+    try:
+        return name, json.loads(r.stdout), None
+    except ValueError:
+        err = (r.stderr.decode(errors='replace').strip().splitlines() or ['no answer'])[-1]
+        asleep = any(s in err for s in ('timed out', 'No route', 'refused', 'unreachable'))
+        return name, [], 'unreachable (asleep?)' if asleep else err[:80]
+
+
+def collect(local_only):
+    me = socket.gethostname().split('.')[0].lower()
+    others = [] if local_only else [h for h in hosts() if not is_me(h)]
+    data, errors = {}, {}
+    with ThreadPoolExecutor(max_workers=len(others) + 1) as ex:
+        futs = [ex.submit(remote, h) for h in others]
+        data[me] = scan()
+        for fu in futs:
+            name, rows, err = fu.result()
+            data[name] = rows
+            if err:
+                errors[name] = err
+    return data, errors
+
+
+# ---------------------------------------------------------------- report
+
+TTY = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
+
+
+def c(s, code):
+    return f'\033[{code}m{s}\033[0m' if TTY else str(s)
+
+
+def dim(s): return c(s, '2')
+def bold(s): return c(s, '1')
+def accent(s): return c(s, '38;5;209')
+
+
+def usd(x):
+    return f'${x:,.2f}' if x < 10_000 else f'${x:,.0f}'
+
+
+def tok(n):
+    for div, suf in ((1e9, 'B'), (1e6, 'M'), (1e3, 'k')):
+        if n >= div:
+            return f'{n / div:.1f}{suf}'
+    return str(int(n))
+
+
+def bar(frac, width=18):
+    full = frac * width
+    return accent('█' * int(full) + ('▌' if full - int(full) >= .5 else ''))
+
+
+def summed(rows, key):
+    out = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        k = key(r)
+        for f in Rows.FIELDS:
+            out[k][f] += r[f]
+        out[k]['unpriced'] += r.get('unpriced', 0)
+    return out
+
+
+def report(data, errors, args):
+    rows = [dict(r, machine=m) for m, rs in data.items() for r in rs]
+    today = date.today()
+    if args.days:
+        args.since = (today - timedelta(days=args.days - 1)).isoformat()
+    if args.since:
+        rows = [r for r in rows if r['day'] >= args.since]
+    if args.json:
+        print(json.dumps({'rows': rows, 'errors': errors}, indent=1))
+        return
+    if not rows:
+        print('No usage found.' + (f' ({", ".join(f"{k}: {v}" for k, v in errors.items())})' if errors else ''))
+        return
+
+    T = summed(rows, lambda r: 'all')['all']
+    total = T['cost']
+    days = sorted({r['day'] for r in rows if r['day'] != '?'})
+    first = date.fromisoformat(days[0])
+    span = (today - first).days + 1
+    W = 64
+    scope = 'this machine' if args.local else f'{len(data) - len(errors)} machine' + ('s' if len(data) - len(errors) != 1 else '')
+    print()
+    print(f' {bold("AI spend")} {dim("· API-equivalent · " + scope)}'.ljust(W) + dim(datetime.now().strftime('%Y-%m-%d %H:%M')))
+    print(dim(' ' + '─' * W))
+    print(f' {"Total":<14}{bold(accent(usd(total))):>22}   {dim(f"since {first} · {span} day{"s" if span != 1 else ""} · {usd(total / span)}/day")}')
+    by_day = summed(rows, lambda r: r['day'])
+    if not args.since:
+        week = sum(v['cost'] for d, v in by_day.items() if d >= (today - timedelta(days=6)).isoformat())
+        month = sum(v['cost'] for d, v in by_day.items() if d >= today.replace(day=1).isoformat())
+        for label, v in (('Today', by_day.get(today.isoformat(), {}).get('cost', 0)), ('Last 7 days', week), ('This month', month)):
+            print(f' {label:<14}{usd(v):>13}')
+
+    def table(title, groups, label=lambda k: k):
+        print(f'\n {bold(title)}')
+        top = max(v['cost'] for v in groups.values()) or 1
+        for k, v in sorted(groups.items(), key=lambda kv: -kv[1]['cost']):
+            pct = 100 * v['cost'] / total if total else 0
+            note = dim(' (no price known)') if v['unpriced'] and not v['cost'] else ''
+            print(f'   {label(k):<20}{usd(v["cost"]):>11}  {dim(f"{pct:4.0f}%")}  {bar(v["cost"] / top)}{note}')
+
+    table('By agent', summed(rows, lambda r: r['tool']), {'claude': 'Claude Code', 'codex': 'Codex'}.get)
+    if len(data) > 1:
+        table('By machine', summed(rows, lambda r: r['machine']))
+    models = summed(rows, lambda r: r['model'])
+    print(f'\n {bold("By model")}{"calls":>20}{"input":>9}{"cache rd":>10}{"output":>9}{"cost":>11}')
+    for k, v in sorted(models.items(), key=lambda kv: -kv[1]['cost']):
+        print(f'   {k:<22}{tok(v["calls"]):>6}{tok(v["input"] + v["cache_write"]):>9}{tok(v["cache_read"]):>10}'
+              f'{tok(v["output"]):>9}{usd(v["cost"]):>11}' + (dim('  no price') if v['unpriced'] and not v['cost'] else ''))
+
+    allin = T['input'] + T['cache_write'] + T['cache_read']
+    print(f'\n {bold("Tokens")}   {tok(allin + T["output"])} total · {tok(allin)} in · {tok(T["output"])} out'
+          + dim(f' (of which {tok(T["reasoning"])} thinking)'))
+    if allin:
+        print(f' {bold("Cache")}    {100 * T["cache_read"] / allin:.0f}% of input read from cache · saved {accent(usd(T["saved"]))}'
+              + dim(f' (would be {usd(total + T["saved"])} uncached)'))
+    sess = summed(rows, lambda r: (r['machine'], r['tool'], r['session']))
+    active = len(days)
+    print(f' {bold("Activity")} {len(sess)} sessions · {tok(T["calls"])} API calls · {active} active days'
+          + dim(f' · {usd(total / len(sess))}/session'))
+    titles = {(r['machine'], r['tool'], r['session']): r['title'] for r in rows if r['title']}
+    top = sorted(sess.items(), key=lambda kv: -kv[1]['cost'])[:max(args.top, 1)]
+    print(f'\n {bold("Priciest session" + ("s" if args.top > 1 else ""))}')
+    for k, v in top:
+        name = (titles.get(k) or k[2][:8])[:34]
+        print(f'   {name:<35}{usd(v["cost"]):>10}  {dim(f"{k[1]} · {k[0]}")}')
+
+    shown = days if args.daily else days[-14:]
+    print(f'\n {bold("Per day")}' + ('' if args.daily or len(days) <= 14 else dim(f'  (last 14 · --daily for all)')))
+    peak = max(by_day[d]['cost'] for d in shown) or 1
+    for d in shown:
+        v = by_day[d]['cost']
+        print(f'   {dim(d) if d != today.isoformat() else bold(d)}  {usd(v):>10}  {bar(v / peak, 30)}')
+    if errors:
+        print()
+        for k, v in errors.items():
+            print(c(f' ! {k}: {v} — not counted', '33'))
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='cost', description=__doc__.split('\n\n')[0])
+    ap.add_argument('-d', '--days', type=int, help='only the last N days (today included)')
+    ap.add_argument('--since', help='only from this date (YYYY-MM-DD)')
+    ap.add_argument('--local', action='store_true', help="this machine only (don't SSH to the others)")
+    ap.add_argument('--daily', action='store_true', help='show every day, not just the last 14')
+    ap.add_argument('--top', type=int, default=1, metavar='N', help='list the N priciest sessions')
+    ap.add_argument('--json', action='store_true', help='print the raw rows as JSON')
+    ap.add_argument('--scan', action='store_true', help=argparse.SUPPRESS)  # used over SSH
+    args = ap.parse_args()
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if os.name == 'nt':
+        os.system('')  # turns on ANSI colours in the Windows console
+    if args.scan:
+        json.dump(scan(), sys.stdout)
+        return
+    t = time.time()
+    data, errors = collect(args.local)
+    report(data, errors, args)
+    if os.environ.get('COST_TIMING'):
+        print(dim(f' {time.time() - t:.1f}s'))
+
+
+if __name__ == '__main__':
+    main()

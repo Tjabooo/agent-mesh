@@ -568,7 +568,9 @@ def init(args):
     SHARED_CODEX.parent.mkdir(exist_ok=True)
     SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
                             + ''.join(l + '\n' for l in keep), encoding='utf-8')
-    shutil.copy2(TOOL, REPO / 'bin' / 'agent-mesh')
+    for tool in ('agent-mesh', 'agent_mesh_export.py', 'cost'):  # the tools travel with the mesh
+        if (TOOL.parent / tool).exists():
+            shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
     (REPO / '.gitignore').write_text('__pycache__/\n*.pyc\n', encoding='utf-8')
     readme = TEMPLATE / 'README.md'
@@ -586,14 +588,15 @@ def init(args):
 
 
 def link_command():
-    """~/.local/bin/agent-mesh -> the mesh's own copy (Linux/macOS), if nothing is there yet."""
+    """~/.local/bin/{agent-mesh,cost} -> the mesh's own copies (Linux/macOS), if nothing is there yet."""
     if WINDOWS:
         return
-    command = HOME / '.local' / 'bin' / 'agent-mesh'
-    if not command.exists() and not command.is_symlink():
-        command.parent.mkdir(parents=True, exist_ok=True)
-        command.symlink_to(REPO / 'bin' / 'agent-mesh')
-        print(f'Linked {command}')
+    for name in ('agent-mesh', 'cost'):
+        command, target = HOME / '.local' / 'bin' / name, REPO / 'bin' / name
+        if target.exists() and not command.exists() and not command.is_symlink():
+            command.parent.mkdir(parents=True, exist_ok=True)
+            command.symlink_to(target)
+            print(f'Linked {command}')
 
 
 def timer():
