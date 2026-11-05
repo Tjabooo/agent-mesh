@@ -496,6 +496,11 @@ def export_chatgpt():
         return
     try:
         from agent_mesh_export import publish
+    except ImportError:
+        log('ChatGPT export skipped: bin/agent_mesh_export.py is missing from the mesh '
+            '(copy it there from the agent-mesh repo)')
+        return False
+    try:
         result = publish(REPO)
         if result:
             log(f'ChatGPT export: {result["conversations"]} conversations, '
@@ -569,6 +574,8 @@ def init(args):
     SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
                             + ''.join(l + '\n' for l in keep), encoding='utf-8')
     shutil.copy2(TOOL, REPO / 'bin' / 'agent-mesh')
+    # The mesh's copy is what hooks and timers run, and it imports the exporter from beside itself.
+    shutil.copy2(TOOL.parent / 'agent_mesh_export.py', REPO / 'bin' / 'agent_mesh_export.py')
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
     (REPO / '.gitignore').write_text('__pycache__/\n*.pyc\n', encoding='utf-8')
     readme = TEMPLATE / 'README.md'
