@@ -295,8 +295,23 @@ def render_export(mesh, home, checkout, host, hosts):
 def run(cmd, cwd=None, check=True):
     env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_MERGE_AUTOEDIT': 'no'}
     ssh = 'C:/Windows/System32/OpenSSH/ssh.exe' if os.name == 'nt' else 'ssh'
-    env['GIT_SSH_COMMAND'] = f'{ssh} -o BatchMode=yes -o ConnectTimeout=8'
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+    env['GIT_SSH_COMMAND'] = (f'{ssh} -o BatchMode=yes -o ConnectTimeout=8 '
+                              '-o ServerAliveInterval=10 -o ServerAliveCountMax=2')
+    # Never inherit the calling SSH session's stdin. On Windows, also kill the whole Git/SSH
+    # process tree on timeout: killing only git.exe leaves children holding the output pipes.
+    process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        stdout, stderr = process.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                           capture_output=True, timeout=10)
+        else:
+            process.kill()
+        process.communicate(timeout=10)
+        raise RuntimeError('Git operation timed out; stopped the export process') from None
+    result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
     if check and result.returncode:
         raise RuntimeError(redact((result.stderr or result.stdout).strip())[:400])
     return result
