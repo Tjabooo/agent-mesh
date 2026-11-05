@@ -13,11 +13,12 @@ or a bare repo on one of your machines.
 | --- | --- |
 | `AGENTS.md` | Every agent's instructions. Claude Code imports it (`~/.claude/CLAUDE.md` starts with `@~/.agent-mesh/AGENTS.md`; anything below stays local to that machine). Codex gets a copy as `~/.codex/AGENTS.md`, with the memory index and the newest memories inline; older memories are read on demand. |
 | `memory/` | The one memory. Every Claude Code project's memory folder (`~/.claude/projects/*/memory`) becomes a link to it (a junction on Windows). `MEMORY.md` is the index. Tell Codex in AGENTS.md to save memories here too. |
-| `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
+| `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules, `enableArtifact`, `disableClaudeAiConnectors`, `skillOverrides`). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
 | `codex/config.toml` | Top-level Codex settings to share (`model`, `model_reasoning_effort`). |
 | `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
 | `bin/cost` | `cost`: what all your Claude Code and Codex chats would have cost at API prices, across every machine (see below). |
-| `hosts.json` (optional) | Your machines, for `cost` (copy `hosts.example.json`). |
+| `bin/token-audit` | `token-audit`: where the tokens go: fixed per-session overhead, cache breaks, biggest tool results, re-reads, images, subagents (see below). |
+| `hosts.json` (optional) | Your machines, for `cost` and `token-audit` (copy `hosts.example.json`). |
 
 Logins, caches and plugins are never shared. Conversation text can optionally be exported to a
 separate private GitHub repository for ChatGPT; this is disabled until configured.
@@ -62,6 +63,25 @@ A sync commits this machine's changes, pulls and merges the others', pushes, and
 result. Markdown merges line by line (`merge=union`), so two machines saving memories at the same
 time both keep theirs. If a merge still fails, the machine is left as it was and the failure is
 logged in `.git/agent-mesh.log`.
+
+## Where the tokens go
+
+`token-audit` reads the same Claude Code transcripts on every machine (streamed, never loaded whole)
+and shows what fills the context. It sizes the fixed per-session overhead from the request shape
+Claude Code records, so you can see each tool schema, the skills listing, CLAUDE.md sections and the
+memory index. It also lists API usage and cache hit ratio by project and model, cache breaks with
+their cause (idle longer than the cache TTL, compaction, tool list change), the largest tool results,
+unfiltered shell output, full-file reads and re-reads, images, subagents and auto-compactions.
+
+```sh
+token-audit                # all machines, last 14 days
+token-audit -d 7 --local   # this machine, last week
+token-audit --json         # the raw numbers
+```
+
+Every request re-sends the whole prompt, so a tool result is counted as "carried": its size times the
+requests that re-sent it. A 20k-character file read early in a long session can cost a million
+cache-read tokens. Other machines run their own copy from `~/.agent-mesh/bin` over SSH.
 
 ## What your agents cost
 

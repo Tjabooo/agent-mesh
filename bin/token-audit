@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""token-audit: where Claude Code's tokens go, across machines.
+
+Streams ~/.claude/projects/**/*.jsonl (never loads a transcript whole) and reports:
+fixed per-session overhead (exact sizes from the recorded request shape), totals by
+project and model, cache hit ratio and cache breaks, the biggest tool results, repeated
+and full-file reads, unfiltered shell output, images, subagents, auto-compactions and
+per-turn injected attachments.
+
+  token-audit                 all machines, last 14 days
+  token-audit -d 7            last 7 days          token-audit --local   this machine only
+  token-audit --json          raw numbers          token-audit --top 50  longer lists
+
+Other machines are scanned over SSH with the copy of this script in ~/.agent-mesh/bin there
+(the mesh syncs it); machines come from the same hosts.json files as `cost`.
+
+Token figures: API usage numbers are exact. Sizes of individual pieces (a tool result, a
+CLAUDE.md section) are characters divided by a ratio measured from each machine's first
+requests (prompt tokens / prompt characters), shown in the header. "Carried" tokens for a
+tool result = its size x the requests that re-sent it before the session ended or compacted:
+that is what it really costs, mostly as cache reads.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+FILTERS = re.compile(r'\|\s*(head|tail|grep|rg|wc|sed|awk|jq|cut|uniq|sort|column|less|python3?\b)|'
+                     r'\b(head|tail|wc|grep|rg)\s+-|--quiet|-q\b|>\s*/dev/null|\bjq\b')
+SECTION = re.compile(r'(?m)^(?=# |Contents of |<system-reminder>|The following |## )')
+TOP = 30
+
+
+# ---------------------------------------------------------------- scan (runs on each machine)
+
+def ts(s):
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def text_of(content):
+    """(chars, images) of a tool_result / message content."""
+    if isinstance(content, str):
+        return len(content), []
+    chars, imgs = 0, []
+    for x in content or []:
+        if not isinstance(x, dict):
+            continue
+        if x.get('type') == 'text':
+            chars += len(x.get('text', ''))
+        elif x.get('type') == 'image':
+            imgs.append(image_tokens(x.get('source') or {}))
+        elif x.get('type') == 'tool_reference':
+            chars += 40
+    return chars, imgs
+
+
+def image_tokens(src):
+    """Approximate tokens for a base64 image: (w*h)/750 after scaling the long edge to 1568."""
+    data = src.get('data') or ''
+    w = h = 0
+    try:
+        raw = base64.b64decode(data[:65536] + '=' * (-len(data[:65536]) % 4))
+        if raw[:8] == b'\x89PNG\r\n\x1a\n':
+            w, h = struct.unpack('>II', raw[16:24])
+        elif raw[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(raw) - 9:
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                mk, ln = raw[i + 1], struct.unpack('>H', raw[i + 2:i + 4])[0]
+                if 0xC0 <= mk <= 0xCF and mk not in (0xC4, 0xC8, 0xCC):
+                    h, w = struct.unpack('>HH', raw[i + 5:i + 9])
+                    break
+                i += 2 + ln
+    except Exception:
+        pass
+    if not w or not h:
+        return {'w': 0, 'h': 0, 'tok': 1600}
+    s = min(1.0, 1568 / max(w, h))
+    return {'w': w, 'h': h, 'tok': int(w * s * h * s / 750)}
+
+
+def records(path, cutoff):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t = ts(d.get('timestamp'))
+                if t is not None and t < cutoff:
+                    continue
+                yield d
+    except OSError:
+        return
+
+
+def short(s, n=90):
+    s = ' '.join(str(s).split())
+    return s if len(s) <= n else s[:n - 1] + '…'
+
+
+def detail(name, inp):
+    inp = inp or {}
+    if name == 'Bash':
+        return inp.get('command', '')
+    if name in ('Read', 'Edit', 'Write', 'NotebookEdit'):
+        r = inp.get('file_path', '')
+        if inp.get('offset') or inp.get('limit') or inp.get('pages'):
+            r += f" [{inp.get('offset', '')}:{inp.get('limit', '')}{inp.get('pages', '')}]"
+        return r
+    if name in ('Grep', 'Glob'):
+        return f"{inp.get('pattern', '')} {inp.get('path', '')}"
+    if name == 'Agent':
+        return f"{inp.get('subagent_type', 'general')}: {inp.get('description', '')}"
+    for k in ('url', 'query', 'prompt', 'description', 'action'):
+        if k in inp:
+            return f'{k}={inp[k]}'
+    return json.dumps(inp)[:120]
+
+
+def scan_session(path, cutoff, project, out, prefix_seen):
+    sub = path.parent.name == 'subagents'
+    session = path.parent.parent.name if sub else path.stem
+    S = out['_sess'].setdefault(session, {'project': project, 'reqs': [], 'tools': {}, 'results': [],
+                                          'compacts': [], 'shapes': {}, 'blobs': {}, 'apireq': {},
+                                          'subfiles': {}, 'spawns': [], 'title': ''})
+    msgs = {}
+    order = []
+    tool_uses = {}
+    results = []
+    for d in records(path, cutoff):
+        t = d.get('type')
+        if t == 'ai-title':
+            S['title'] = d.get('aiTitle', '')
+        elif t == 'api-request-shape':
+            sh = d.get('shape') or {}
+            S['shapes'][d.get('shapeHash')] = sh
+        elif t == 'api-request-blob':
+            S['blobs'][d.get('hash')] = d.get('message') or {}
+        elif t == 'api-request' and not sub:
+            S['apireq'][d.get('id')] = d
+        elif t == 'system' and d.get('subtype') == 'compact_boundary' and not sub:
+            md = d.get('compactMetadata') or {}
+            S['compacts'].append({'t': ts(d.get('timestamp')), 'trigger': md.get('trigger'),
+                                  'pre': md.get('preTokens'), 'n': len(order)})
+        elif t == 'attachment' and not sub:
+            a = d.get('attachment') or {}
+            at = a.get('type') or '?'
+            n = len(str(d.get('rendered') or ''))
+            out['attach'][at][0] += 1
+            out['attach'][at][1] += n
+            if at == 'edited_text_file':
+                fn = a.get('filename') or a.get('path') or '?'
+                out['edited'][fn][0] += 1
+                out['edited'][fn][1] += n
+        elif t == 'assistant':
+            m = d.get('message') or {}
+            if m.get('model') == '<synthetic>':
+                continue
+            key = m.get('id') or d.get('requestId') or d.get('uuid')
+            if key not in msgs:
+                order.append(key)
+            msgs[key] = d
+            for x in m.get('content') or []:
+                if isinstance(x, dict) and x.get('type') == 'tool_use':
+                    tool_uses[x.get('id')] = (x.get('name'), x.get('input') or {}, len(order), ts(d.get('timestamp')))
+        elif t == 'user':
+            m = d.get('message') or {}
+            c = m.get('content')
+            if isinstance(c, list):
+                for x in c:
+                    if not isinstance(x, dict):
+                        continue
+                    if x.get('type') == 'tool_result':
+                        chars, imgs = text_of(x.get('content'))
+                        results.append((x.get('tool_use_id'), chars, imgs, len(order)))
+                    elif x.get('type') == 'image':
+                        out['images']['pasted'][0] += 1
+                        out['images']['pasted'][1] += image_tokens(x.get('source') or {})['tok']
+            if d.get('isCompactSummary') and not sub:
+                S['compacts'].append({'t': ts(d.get('timestamp')), 'trigger': 'summary', 'pre': None, 'n': len(order)})
+    # usage
+    reqs = []
+    for i, k in enumerate(order):
+        d = msgs[k]
+        if k in prefix_seen:
+            continue
+        prefix_seen.add(k)
+        m = d['message']
+        u = m.get('usage') or {}
+        cc = u.get('cache_creation') or {}
+        r = {'i': i, 't': ts(d.get('timestamp')), 'model': m.get('model') or '?',
+             'in': u.get('input_tokens') or 0, 'cr': u.get('cache_read_input_tokens') or 0,
+             'cw': u.get('cache_creation_input_tokens') or 0, 'cw1h': cc.get('ephemeral_1h_input_tokens') or 0,
+             'out': u.get('output_tokens') or 0, 'ttl': d.get('promptCacheRequested'),
+             'ref': d.get('requestRef')}
+        reqs.append(r)
+        b = out['usage'][f"{project}\t{r['model']}\t{'sub' if sub else 'main'}"]
+        for f in ('in', 'cr', 'cw', 'cw1h', 'out'):
+            b[f] += r[f]
+        b['n'] += 1
+    nreq = len(order)
+    if sub:
+        S['subfiles'][path.stem] = {'tok': sum(r['in'] + r['cr'] + r['cw'] + r['out'] for r in reqs),
+                                     'cost_in': sum(r['in'] + r['cw'] for r in reqs), 'n': len(reqs),
+                                     'reads': [detail(*tool_uses[u][:2]) for u in tool_uses if tool_uses[u][0] in ('Read', 'Bash', 'Grep', 'Glob')],
+                                     'first': reqs[0]['in'] + reqs[0]['cr'] + reqs[0]['cw'] if reqs else 0,
+                                     'meta': read_meta(path)}
+        out['subagent_tokens'] += sum(r['in'] + r['cr'] + r['cw'] + r['out'] for r in reqs)
+        return
+    S['reqs'] = reqs
+    S['nreq'] = nreq
+    S['tools'] = tool_uses
+    S['results'] = results
+
+
+def read_meta(path):
+    p = path.with_suffix('.meta.json')
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def finish_session(session, S, out, top):
+    """Turn one session's raw data into the aggregate rows."""
+    nreq = S.get('nreq', 0)
+    proj = S['project']
+    compact_at = sorted(c['n'] for c in S['compacts'])
+
+    def carried(n):  # requests that re-send something added before request n
+        nxt = [c for c in compact_at if c > n]
+        end = nxt[0] if nxt else nreq
+        return max(1, end - n)
+
+    reads = defaultdict(list)
+    modified = defaultdict(list)
+    used = set()
+    for tid, (name, inp, n, t) in S['tools'].items():
+        key = f"Skill:{inp.get('skill')}" if name == 'Skill' else (name.split('__')[0] + '__' + name.split('__')[1] if name.startswith('mcp__') else name)
+        out['uses'][key][0] += 1
+        used.add(key)
+        if name in ('Edit', 'Write', 'NotebookEdit'):
+            modified[inp.get('file_path')].append(n)
+        if name == 'Agent':
+            S['spawns'].append((n, inp))
+        if name == 'Workflow':
+            out['workflows'].append({'session': session, 'project': proj, 'detail': short(detail(name, inp), 80)})
+    for key in used:
+        out['uses'][key][1] += 1
+    for tid, chars, imgs, n in S['results']:
+        name, inp, _, _ = S['tools'].get(tid, ('?', {}, n, None))
+        tok = chars / out['ratio_guess']
+        c = carried(n)
+        out['tool'][name][0] += 1
+        out['tool'][name][1] += chars
+        out['tool'][name][2] += tok * c
+        row = {'session': session[:8], 'project': proj, 'tool': name, 'detail': short(detail(name, inp)),
+               'chars': chars, 'carried': int(tok * c)}
+        out['big'].append(row)
+        if name == 'Bash' and chars > 20000 and not FILTERS.search(inp.get('command', '')):
+            out['unfiltered'].append(row)
+        if name == 'Read' and not imgs:
+            fp = inp.get('file_path')
+            full = not (inp.get('offset') or inp.get('limit') or inp.get('pages'))
+            reads[fp].append((n, chars, full, row))
+            if full and chars > 20000:
+                out['fullreads'].append(row)
+        for im in imgs:
+            src = 'Read' if name == 'Read' else ('MCP/' + name if name.startswith('mcp__') else name)
+            out['images'][src][0] += 1
+            out['images'][src][1] += im['tok']
+            out['images'][src][2] += im['tok'] * c
+            out['imglist'].append({'session': session[:8], 'project': proj, 'tool': name,
+                                   'detail': short(detail(name, inp), 70), 'w': im['w'], 'h': im['h'], 'tok': im['tok']})
+    # repeated reads: the same file read again with no edit in between
+    for fp, rs in reads.items():
+        rs.sort(key=lambda r: r[0])
+        for prev, cur in zip(rs, rs[1:]):
+            if any(prev[0] <= m <= cur[0] for m in modified.get(fp, [])):
+                continue
+            if cur[1] < 200:
+                continue
+            out['reread'].append(dict(cur[3], prev_full=prev[2]))
+    # cache breaks
+    prev = None
+    shapes = {}
+    for r in S['reqs']:
+        a = S['apireq'].get(r['ref']) or {}
+        shapes[r['i']] = a.get('shapeHash')
+        total = r['in'] + r['cr'] + r['cw']
+        if prev is not None:
+            ptot = prev['in'] + prev['cr'] + prev['cw']
+            if r['cr'] < 0.8 * ptot and ptot > 5000:
+                gap = (r['t'] or 0) - (prev['t'] or 0)
+                ttl = 300 if (r['ttl'] or prev['ttl']) == '5m' else 3600
+                if any(prev['i'] < c <= r['i'] for c in compact_at):
+                    cause = 'compaction'
+                elif gap > ttl:
+                    cause = f'gap>{ttl // 60}m TTL'
+                elif r['model'] != prev['model']:
+                    cause = 'model switch'
+                elif shapes.get(r['i']) and shapes.get(prev['i']) and shapes[r['i']] != shapes[prev['i']]:
+                    cause = 'tools/system changed'
+                else:
+                    cause = 'other'
+                lost = ptot - r['cr']
+                out['breaks'][cause][0] += 1
+                out['breaks'][cause][1] += lost
+                out['breaklist'].append({'session': session[:8], 'project': proj, 'cause': cause,
+                                         'lost': lost, 'gap_min': round(gap / 60, 1)})
+        prev = r
+    # first request of the session = fixed overhead actually sent
+    if S['reqs']:
+        r0 = S['reqs'][0]
+        a = S['apireq'].get(r0['ref'])
+        tokens = r0['in'] + r0['cr'] + r0['cw']
+        out['first'].append({'session': session[:8], 'tok': tokens, 'cr': r0['cr'], 't': r0['t']})
+        c = first_request(S)
+        if c:
+            sh = c[2]
+            if out['latest'] is None or (r0['t'] or 0) > out['latest']['t']:
+                out['latest'] = {'t': r0['t'], 'session': session[:8], 'tok': tokens,
+                                 'parts': overhead_parts(sh, [S['blobs'].get(h, {}) for h in a.get('tail') or []])}
+    # compactions
+    for c in S['compacts']:
+        if c['trigger'] == 'summary':
+            continue
+        before = sorted((r for r in S['results'] if c['n'] - 25 <= r[3] <= c['n']), key=lambda r: -r[1])[:3]
+        lead = [f"{S['tools'].get(r[0], ('?', {}))[0]} {short(detail(*S['tools'].get(r[0], ('?', {}))[:2]), 50)} ({r[1] // 1000}k ch)" for r in before]
+        out['compactions'].append({'session': session[:8], 'project': proj, 'title': short(S['title'], 50),
+                                   'trigger': c['trigger'], 'pre': c['pre'], 'at_req': c['n'], 'lead': lead})
+    # subagents: what they read that the parent already had
+    for stem, sf in S['subfiles'].items():
+        meta = sf['meta']
+        spawn_n = None
+        for n, inp in S['spawns']:
+            if meta.get('description') and inp.get('description') == meta.get('description'):
+                spawn_n = n
+        parent_reads = {detail(nm, inp) for (nm, inp, n, _) in S['tools'].values()
+                        if nm in ('Read', 'Bash', 'Grep', 'Glob') and (spawn_n is None or n <= spawn_n)}
+        overlap = sum(1 for x in sf['reads'] if x in parent_reads)
+        out['subagents'].append({'session': session[:8], 'project': proj, 'type': meta.get('agentType') or meta.get('subagent_type') or '?',
+                                 'desc': short(meta.get('description') or stem, 50), 'tok': sf['tok'], 'n': sf['n'],
+                                 'first': sf['first'], 'reads': len(sf['reads']), 'overlap': overlap})
+    out['sessions'] += 1
+    out['requests'] += nreq
+
+
+def first_request(S):
+    """(prompt tokens, prompt chars, shape) of the session's first request, when its shape was recorded."""
+    if not S['reqs']:
+        return None
+    r0 = S['reqs'][0]
+    a = S['apireq'].get(r0['ref'])
+    if not a or a.get('shapeHash') not in S['shapes']:
+        return None
+    sh = S['shapes'][a['shapeHash']]
+    chars = len(json.dumps(sh.get('system'))) + len(json.dumps(sh.get('tools')))
+    chars += sum(len(json.dumps(S['blobs'].get(h, {}).get('content'))) for h in a.get('tail') or [])
+    return r0['in'] + r0['cr'] + r0['cw'], chars, sh
+
+
+def overhead_parts(shape, blobs):
+    parts = []
+    for i, x in enumerate(shape.get('system') or []):
+        parts.append((f'system prompt #{i}', len(x.get('text', ''))))
+    for t in shape.get('tools') or []:
+        parts.append((f"tool schema: {t.get('name')}", len(json.dumps(t))))
+    for b in blobs:
+        for x in b.get('content') or []:
+            if x.get('type') == 'tool_addition':
+                d = (x.get('tool') or {}).get('definition') or {}
+                parts.append((f"tool schema: {d.get('name')}", len(json.dumps(d))))
+                continue
+            t = x.get('text') or ''
+            if not t:
+                continue
+            for p in SECTION.split(t):
+                if not p.strip():
+                    continue
+                head = p.strip().splitlines()[0]
+                if head.startswith('Contents of '):
+                    head = 'file: ' + head[12:].split(' (')[0]
+                parts.append((short(head, 70), len(p)))
+    return parts
+
+
+def scan(days):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+    roots = {p.resolve() for p in (Path.home() / '.claude' / 'projects', Path.home() / '.claude-2' / 'projects') if p.is_dir()}
+    files = {f.resolve() for r in roots for f in r.rglob('*.jsonl') if f.stat().st_mtime >= cutoff}
+    out = {'_sess': {}, 'usage': defaultdict(lambda: Counter()), 'attach': defaultdict(lambda: [0, 0]),
+           'edited': defaultdict(lambda: [0, 0]), 'tool': defaultdict(lambda: [0, 0, 0.0]),
+           'images': defaultdict(lambda: [0, 0, 0]), 'imglist': [], 'big': [], 'unfiltered': [], 'fullreads': [],
+           'reread': [], 'breaks': defaultdict(lambda: [0, 0]), 'breaklist': [], 'first': [], 'calib': [],
+           'latest': None, 'compactions': [], 'subagents': [], 'workflows': [], 'sessions': 0, 'requests': 0,
+           'subagent_tokens': 0, 'ratio_guess': 4.0, 'uses': defaultdict(lambda: [0, 0]), 'files': len(files)}
+    seen = set()
+    # main transcripts first so subagent files can attach to their session
+    for f in sorted(files, key=lambda f: (f.parent.name == 'subagents', str(f))):
+        proj = (f.parents[2] if f.parent.name == 'subagents' else f.parent).name
+        scan_session(f, cutoff, proj, out, seen)
+    # measured chars per token (first request of each session), then size everything with it
+    sess = out.pop('_sess')
+    for S in sess.values():
+        c = first_request(S)
+        if c:
+            out['calib'].append(c[:2])
+    tok = sum(a for a, b in out['calib'])
+    ch = sum(b for a, b in out['calib'])
+    out['ratio_guess'] = (ch / tok) if tok else 4.0
+    for s, S in sess.items():
+        finish_session(s, S, out, TOP)
+    out['big'] = sorted(out['big'], key=lambda r: -r['chars'])[:TOP * 2]
+    for k in ('unfiltered', 'fullreads', 'reread'):
+        out[k + '_total'] = [len(out[k]), sum(r['chars'] for r in out[k]), sum(r['carried'] for r in out[k])]
+        out[k] = sorted(out[k], key=lambda r: -r['carried'])[:TOP]
+    out['imglist'] = sorted(out['imglist'], key=lambda r: -r['tok'])[:TOP]
+    out['breaklist'] = sorted(out['breaklist'], key=lambda r: -r['lost'])[:TOP]
+    out['first'] = sorted(out['first'], key=lambda r: -(r['t'] or 0))[:TOP]
+    out['calib'] = [tok, ch]
+    return json.loads(json.dumps(out))
+
+
+# ---------------------------------------------------------------- machines (same hosts as `cost`)
+
+def hosts():
+    mesh = Path(__file__).resolve().parent.parent / 'hosts.json'
+    for p in (os.environ.get('COST_HOSTS_FILE'), mesh, '~/.config/cost/hosts.json', '~/.config/archfleet/hosts.json'):
+        if p and Path(p).expanduser().is_file():
+            try:
+                return json.loads(Path(p).expanduser().read_text())
+            except ValueError:
+                pass
+    return []
+
+
+def me():
+    return socket.gethostname().split('.')[0].lower()
+
+
+def remote(h, days):
+    ssh = r'C:\Windows\System32\OpenSSH\ssh.exe' if os.name == 'nt' else 'ssh'
+    win = h.get('os') == 'windows'
+    py = 'python' if win else 'python3'
+    script = r'%USERPROFILE%\.agent-mesh\bin\token-audit' if win else '~/.agent-mesh/bin/token-audit'
+    name = h.get('hostname') or h['alias']
+    try:
+        r = subprocess.run([ssh, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=4', '-o', 'LogLevel=ERROR',
+                            h['alias'], f'{py} {script} --scan -d {days}'],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return name, None, 'timed out'
+    try:
+        return name, json.loads(r.stdout), None
+    except ValueError:
+        err = (r.stderr.decode(errors='replace').strip().splitlines() or ['no answer'])[-1]
+        return name, None, err[:100]
+
+
+def collect(days, local_only):
+    others = [] if local_only else [h for h in hosts() if me() not in
+                                     {str(h.get(k, '')).lower() for k in ('hostname', 'alias', 'label')}]
+    data, errors = {}, {}
+    with ThreadPoolExecutor(max_workers=len(others) + 1) as ex:
+        futs = [ex.submit(remote, h, days) for h in others]
+        data[me()] = scan(days)
+        for fu in futs:
+            name, d, err = fu.result()
+            if d:
+                data[name.lower()] = d
+            else:
+                errors[name] = err
+    return data, errors
+
+
+# ---------------------------------------------------------------- report
+
+def k(n):
+    n = float(n or 0)
+    for div, suf in ((1e9, 'G'), (1e6, 'M'), (1e3, 'k')):
+        if abs(n) >= div:
+            return f'{n / div:.1f}{suf}'
+    return f'{n:.0f}'
+
+
+# $/MTok: input, output, cache read; cache write = 1.25x (5 min) or 2x (1 h) input
+PRICES = {'claude-opus-5-5': (4, 20, 0.20), 'claude-sonnet-5-5': (3, 15, 0.30), 'claude-haiku-5-5': (1, 5, 0.10),
+          'claude-fable-5-1': (10, 50, 0.25), 'claude-opus-5': (5, 25, 0.50)}
+
+
+def price(model, b):
+    p = PRICES.get(model) or next((v for m, v in PRICES.items() if model.startswith(m)), (4, 20, 0.2))
+    cw1h = b.get('cw1h', 0)
+    return (b['in'] * p[0] + b['out'] * p[1] + b['cr'] * p[2] + cw1h * p[0] * 2 + (b['cw'] - cw1h) * p[0] * 1.25) / 1e6
+
+
+def report(data, errors, days, top):
+    P = print
+    P(f'token-audit: last {days} days, machines: {", ".join(data)}' + (f'  (no answer: {errors})' if errors else ''))
+    for m, d in data.items():
+        tok, ch = d['calib']
+        P(f'  {m}: {d["files"]} transcript files, {d["sessions"]} sessions, {d["requests"]} main-thread requests; '
+          f'{ch / tok if tok else 0:.2f} chars/token measured over {len(d["first"])} first requests')
+    P('\n## Totals by project and model (exact API usage)')
+    P(f'{"machine":9} {"project":34} {"model":18} {"thread":6} {"reqs":>6} {"input":>7} {"cache_w":>8} {"cache_r":>8} {"output":>7} {"hit%":>5} {"$api":>8}')
+    tot = Counter()
+    rows = []
+    for m, d in data.items():
+        for key, b in d['usage'].items():
+            proj, model, thr = key.split('\t')
+            rows.append((m, proj, model, thr, b))
+    for m, proj, model, thr, b in sorted(rows, key=lambda r: -price(r[2], r[4])):
+        hit = b['cr'] / max(1, b['cr'] + b['cw'] + b['in']) * 100
+        usd = price(model, b)
+        tot.update(b)
+        tot['usd'] += usd
+        P(f'{m:9} {short(proj, 34):34} {model[:18]:18} {thr:6} {b["n"]:6} {k(b["in"]):>7} {k(b["cw"]):>8} {k(b["cr"]):>8} {k(b["out"]):>7} {hit:5.1f} {usd:8.2f}')
+    hit = tot['cr'] / max(1, tot['cr'] + tot['cw'] + tot['in']) * 100
+    P(f'{"TOTAL":9} {"":34} {"":18} {"":6} {tot["n"]:6} {k(tot["in"]):>7} {k(tot["cw"]):>8} {k(tot["cr"]):>8} {k(tot["out"]):>7} {hit:5.1f} {tot["usd"]:8.2f}')
+
+    P('\n## Fixed overhead: first request of the newest session on each machine')
+    for m, d in data.items():
+        L = d.get('latest')
+        if not L:
+            continue
+        r = d['calib'][1] / max(1, d['calib'][0])
+        P(f'  {m} (session {L["session"]}): {k(L["tok"])} tokens in the first request, incl. the first prompt')
+        groups = Counter()
+        for name, n in L['parts']:
+            groups[name] += n
+        for name, n in groups.most_common(top):
+            if n / r >= 150:
+                P(f'     {n / r:7.0f} tok  {name}')
+    P('\n## Cache breaks (a request that re-wrote >20% of the previous prompt)')
+    for m, d in data.items():
+        for cause, (n, lost) in sorted(d['breaks'].items(), key=lambda x: -x[1][1]):
+            P(f'  {m:9} {cause:22} {n:5}x  {k(lost):>7} tokens re-written')
+    allb = sorted((dict(r, m=m) for m, d in data.items() for r in d['breaklist']), key=lambda r: -r['lost'])[:10]
+    for r in allb:
+        P(f'     {r["m"]:8} {r["session"]} {short(r["project"], 22):22} {r["cause"]:20} {k(r["lost"]):>7} gap {r["gap_min"]} min')
+
+    def lst(title, key, cols=('tool', 'chars', 'carried', 'detail')):
+        rs = sorted((dict(r, m=m) for m, d in data.items() for r in d[key]), key=lambda r: -r.get('carried', r.get('chars', 0)))[:top]
+        tl = [d.get(key + '_total') for d in data.values() if d.get(key + '_total')]
+        extra = ''
+        if tl:
+            extra = f'  — {sum(t[0] for t in tl)} total, {k(sum(t[1] for t in tl))} chars, {k(sum(t[2] for t in tl))} carried tokens'
+        P(f'\n## {title}{extra}')
+        for r in rs:
+            P(f'  {r["m"]:8} {r["session"]} {r["tool"][:12]:12} {k(r["chars"]):>6} ch {k(r["carried"]):>7} carried  {r["detail"]}')
+
+    P('\n## Tool results by tool (count, size, carried tokens)')
+    tt = defaultdict(lambda: [0, 0, 0.0])
+    for d in data.values():
+        for name, v in d['tool'].items():
+            for i in range(3):
+                tt[name][i] += v[i]
+    for name, v in sorted(tt.items(), key=lambda x: -x[1][2])[:15]:
+        P(f'  {name[:30]:30} {v[0]:6}x {k(v[1]):>7} ch {k(v[2]):>8} carried tok')
+    rs = sorted((dict(r, m=m) for m, d in data.items() for r in d['big']), key=lambda r: -r['chars'])[:top]
+    P(f'\n## {top} largest tool results')
+    for r in rs:
+        P(f'  {r["m"]:8} {r["session"]} {r["tool"][:12]:12} {k(r["chars"]):>6} ch {k(r["carried"]):>7} carried  {r["detail"]}')
+    lst('Shell output over 20k chars (~5k tok) with no head/grep/tail/wc filter', 'unfiltered')
+    lst('Full-file Reads over 20k chars (no offset/limit)', 'fullreads')
+    lst('Re-reads of a file already read, with no edit in between', 'reread')
+    P('\n## Images (approx. tokens: w*h/750 after scaling to 1568 px)')
+    for m, d in data.items():
+        for src, v in d['images'].items():
+            P(f'  {m:9} {src:22} {v[0]:5}x {k(v[1]):>7} tok  {k(v[2] if len(v) > 2 else v[1]):>8} carried')
+    for r in sorted((dict(r, m=m) for m, d in data.items() for r in d['imglist']), key=lambda r: -r['tok'])[:8]:
+        P(f'     {r["m"]:8} {r["session"]} {r["w"]}x{r["h"]} {r["tok"]} tok  {r["tool"]} {r["detail"]}')
+    P('\n## Subagents (overlap = reads/commands the parent had already run before the spawn)')
+    subs = sorted((dict(r, m=m) for m, d in data.items() for r in d['subagents']), key=lambda r: -r['tok'])
+    for m, d in data.items():
+        P(f'  {m:9} {len([s for s in subs if s["m"] == m])} subagents, {k(d["subagent_tokens"])} tokens; '
+          f'{len(d["workflows"])} Workflow calls')
+    for r in subs[:top]:
+        P(f'     {r["m"]:8} {r["session"]} {r["type"][:16]:16} {k(r["tok"]):>7} tok {r["n"]:3} req, first {k(r["first"])}, '
+          f'{r["overlap"]}/{r["reads"]} reads re-done  {r["desc"]}')
+    P('\n## Auto-compactions')
+    for m, d in data.items():
+        for c in d['compactions']:
+            P(f'  {m:8} {c["session"]} {c["trigger"]} at {k(c["pre"])} tok, request {c["at_req"]}: {c["title"]}')
+            for x in c['lead']:
+                P(f'        before it: {x}')
+    P('\n## Injected per-turn attachments (rendered chars; these stay in context)')
+    at = defaultdict(lambda: [0, 0])
+    ed = defaultdict(lambda: [0, 0])
+    for d in data.values():
+        for a, (n, c) in d['attach'].items():
+            at[a][0] += n
+            at[a][1] += c
+        for a, (n, c) in d['edited'].items():
+            ed[a][0] += n
+            ed[a][1] += c
+    for a, (n, c) in sorted(at.items(), key=lambda x: -x[1][1])[:14]:
+        P(f'  {a:28} {n:6}x {k(c):>7} ch')
+    P('  "file changed on disk" notices by file:')
+    for a, (n, c) in sorted(ed.items(), key=lambda x: -x[1][1])[:8]:
+        P(f'     {n:5}x {k(c):>7} ch  {short(a, 80)}')
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='token-audit', description=__doc__.split('\n\n')[0])
+    ap.add_argument('-d', '--days', type=int, default=14)
+    ap.add_argument('--local', action='store_true', help="this machine only (don't SSH to the others)")
+    ap.add_argument('--top', type=int, default=TOP)
+    ap.add_argument('--json', action='store_true', help='print the raw numbers as JSON')
+    ap.add_argument('--from', dest='src', nargs='+', metavar='FILE',
+                    help='report on saved `--scan` JSON files (one per machine, named <machine>.json)')
+    ap.add_argument('--scan', action='store_true', help=argparse.SUPPRESS)  # used over SSH
+    a = ap.parse_args()
+    if a.src:
+        report({Path(f).stem: json.loads(Path(f).read_text()) for f in a.src}, {}, a.days, a.top)
+        return
+    if a.scan:
+        json.dump(scan(a.days), sys.stdout)
+        return
+    data, errors = collect(a.days, a.local)
+    if a.json:
+        json.dump({'machines': data, 'errors': errors}, sys.stdout)
+    else:
+        report(data, errors, a.days, a.top)
+
+
+if __name__ == '__main__':
+    main()

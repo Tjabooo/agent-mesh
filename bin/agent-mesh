@@ -54,7 +54,8 @@ LOCK = REPO / '.git' / 'agent-mesh.lock'
 IMPORT_LINE = '@' + (('~/' + REPO.relative_to(HOME).as_posix()) if REPO.is_relative_to(HOME) else REPO.as_posix()) + '/AGENTS.md'
 # Settings every machine shares. Everything else in settings.json stays per machine (hooks, the
 # permission mode and allow list, machine paths).
-SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask')
+SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask',
+               'enableArtifact', 'disableClaudeAiConnectors', 'skillOverrides')
 CODEX_KEYS = ('model', 'model_reasoning_effort')
 MEMORY_INLINE = 12000  # characters of the newest memories copied into Codex's AGENTS.md; the rest it reads from the index
 HOST = socket.gethostname().lower()
@@ -355,7 +356,7 @@ def write_codex():
     # memories in full (the likeliest handovers); inlining everything cost every Codex turn ~13k tokens.
     memories, size = [], 0
     for f in sorted(MEMORY.glob('*.md'), key=lambda f: f.stat().st_mtime, reverse=True):
-        if f.name == 'MEMORY.md':
+        if f.name in ('MEMORY.md', 'MEMORY-archive.md'):  # indexes, not memories
             continue
         text = f.read_text(encoding='utf-8').strip()
         if size + len(text) > MEMORY_INLINE:
