@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -294,9 +295,11 @@ def render_export(mesh, home, checkout, host, hosts):
 
 def run(cmd, cwd=None, check=True):
     env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'GIT_MERGE_AUTOEDIT': 'no'}
-    ssh = 'C:/Windows/System32/OpenSSH/ssh.exe' if os.name == 'nt' else 'ssh'
-    env['GIT_SSH_COMMAND'] = (f'{ssh} -o BatchMode=yes -o ConnectTimeout=8 '
-                              '-o ServerAliveInterval=10 -o ServerAliveCountMax=2')
+    if os.name != 'nt':
+        env['GIT_SSH_COMMAND'] = ('ssh -o BatchMode=yes -o ConnectTimeout=8 '
+                                  '-o ServerAliveInterval=10 -o ServerAliveCountMax=2')
+    # For GitHub on Windows, preserve Git's configured SSH transport. Forcing native OpenSSH
+    # through Git's MSYS pipes can hang before connection setup. Mesh/LAN SSH stays unchanged.
     # Never inherit the calling SSH session's stdin. On Windows, also kill the whole Git/SSH
     # process tree on timeout: killing only git.exe leaves children holding the output pipes.
     process = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -348,7 +351,13 @@ def publish(mesh, home=None, host=None):
     if not (checkout / '.git').is_dir():
         if checkout.exists():
             raise RuntimeError('Export checkout exists without .git; inspect it before retrying')
-        run(['git', 'clone', '-q', remote, str(checkout)])
+        staging = checkout.with_name('chatgpt-clone-' + str(os.getpid()))
+        try:
+            run(['git', 'clone', '-q', remote, str(staging)])
+            staging.rename(checkout)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
     def git(*args, check=True):
         return run(['git', *args], cwd=checkout, check=check)
     if git('remote', 'get-url', 'origin').stdout.strip() != remote:
