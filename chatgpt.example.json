@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "repository": "your-account/private-agent-data",
+  "hosts": ["desktop", "laptop", "server"]
+}

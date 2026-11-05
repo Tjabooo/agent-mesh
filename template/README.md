@@ -9,5 +9,7 @@ details about your machines and projects.
 - `claude/settings.json`: Claude Code settings every machine shares
 - `codex/config.toml`: top-level Codex settings every machine shares
 - `bin/agent-mesh`: the tool itself
+- `chatgpt.json` (optional): publish readable conversations and memory to a separate private
+  GitHub repository. See agent-mesh's README; use its `START_HERE.md` through ChatGPT's GitHub app.
 
 New machine: `git clone <this repo> ~/.agent-mesh && python3 ~/.agent-mesh/bin/agent-mesh setup && agent-mesh timer`

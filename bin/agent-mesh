@@ -9,6 +9,7 @@ your machines, kept in step through a git repo you own (the "mesh", ~/.agent-mes
   agent-mesh sync --background   the same, detached (what the Claude Code hooks run)
   agent-mesh timer        also sync every 10 minutes (systemd user timer / Windows scheduled task)
   agent-mesh status       what is linked and whether this machine is in step
+  agent-mesh export-chatgpt    publish opted-in conversations and memory to a private GitHub repo
   agent-mesh codex-notify [--then CMD...]   Codex's after-turn `notify` (set up by sync): syncs,
                           then runs the notify command that was there before
 
@@ -55,7 +56,7 @@ IMPORT_LINE = '@' + (('~/' + REPO.relative_to(HOME).as_posix()) if REPO.is_relat
 # permission mode and allow list, machine paths).
 SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask')
 CODEX_KEYS = ('model', 'model_reasoning_effort')
-MEMORY_INLINE = 40000  # characters of memory copied into Codex's AGENTS.md; longer files are linked
+MEMORY_INLINE = 12000  # characters of the newest memories copied into Codex's AGENTS.md; the rest it reads from the index
 HOST = socket.gethostname().lower()
 # Extra Claude accounts (`claude2` = CLAUDE_CONFIG_DIR=~/.claude-2): every ~/.claude-<name> folder.
 # These parts of one are the main ~/.claude's: links (on Windows, files are copies kept in step: a file
@@ -350,21 +351,29 @@ def ensure_claude_md():
 def write_codex():
     if not CODEX.is_dir():
         return
-    # Codex can't load memory on demand like Claude Code, so its copy has every shared memory inline.
+    # Codex reads memory files with its shell, so its copy carries the index plus only the newest
+    # memories in full (the likeliest handovers); inlining everything cost every Codex turn ~13k tokens.
     memories, size = [], 0
     for f in sorted(MEMORY.glob('*.md'), key=lambda f: f.stat().st_mtime, reverse=True):
         if f.name == 'MEMORY.md':
             continue
         text = f.read_text(encoding='utf-8').strip()
         if size + len(text) > MEMORY_INLINE:
-            memories.append(f'### {f.name}\n\n(too long to include here: read ~/.agent-mesh/memory/{f.name})')
-            continue
+            break
         memories.append(f'### {f.name}\n\n{text}')
         size += len(text)
+    index = MEMORY / 'MEMORY.md'
+    index = index.read_text(encoding='utf-8').strip() if index.exists() else ''
+    extra = REPO / 'codex' / 'AGENTS.codex.md'  # instructions only Codex gets
+    extra = '\n\n' + extra.read_text(encoding='utf-8').strip() + '\n' if extra.exists() else ''
+    mem_dir = '~/' + MEMORY.relative_to(HOME).as_posix() if MEMORY.is_relative_to(HOME) else MEMORY.as_posix()
     body = ('<!-- Written by agent-mesh from ~/.agent-mesh/AGENTS.md and the shared memory.\n'
             '     Edit those instead: this copy is replaced on every sync. -->\n\n'
-            + (REPO / 'AGENTS.md').read_text(encoding='utf-8')
-            + '\n\n## Shared memory (the same memory Claude Code uses; files are in ~/.agent-mesh/memory/)\n\n'
+            + (REPO / 'AGENTS.md').read_text(encoding='utf-8').rstrip() + '\n' + extra
+            + f'\n## Shared memory (the same memory Claude Code uses; files are in {mem_dir}/)\n\n'
+            'Index of every memory. Before working on a topic listed here, read its file '
+            f'(`cat {mem_dir}/<file>`); the newest ones are also included in full below.\n\n'
+            + (index or '(none yet)') + '\n\n### Newest memories in full\n\n'
             + ('\n\n'.join(memories) or '(none yet)') + '\n')
     agents = CODEX / 'AGENTS.md'
     if not agents.exists() or agents.read_text(encoding='utf-8') != body:
@@ -475,9 +484,30 @@ def sync():
         write_codex()
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
+        export_chatgpt()
         return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
     finally:
         LOCK.unlink(missing_ok=True)
+
+
+def export_chatgpt():
+    """An archive outage must not prevent local memory/settings from being applied."""
+    if not (REPO / 'chatgpt.json').exists():
+        return
+    try:
+        from agent_mesh_export import publish
+        result = publish(REPO)
+        if result:
+            log(f'ChatGPT export: {result["conversations"]} conversations, '
+                f'{result["messages"]} messages, {len(result["errors"])} errors')
+    except Exception as error:
+        from agent_mesh_export import redact, utc
+        status = read_json(REPO / '.git' / 'chatgpt-status.json', {})
+        status.update({'ok': False, 'checked_at': utc(), 'error': redact(str(error))[:400]})
+        write_json(REPO / '.git' / 'chatgpt-status.json', status)
+        log(f'ChatGPT export failed (mesh sync completed): {status["error"]}')
+        return False
+    return True
 
 
 def track_origin():
@@ -502,7 +532,7 @@ it from `~/.claude/CLAUDE.md`; Codex gets a copy as `~/.codex/AGENTS.md`. **Edit
 
 ## One brain across machines and agents
 - **Memory is shared.** Claude Code's memory folder for every project on every machine is linked to
-  `{mesh}/memory/` (index: `MEMORY.md`); Codex gets all of it in its AGENTS.md. Save what would help on
+  `{mesh}/memory/` (index: `MEMORY.md`); Codex gets the index and newest memories in its AGENTS.md. Save what would help on
   another machine, in another project or to the other agent, in the usual memory format (a file plus one
   index line); machine-specific facts say which machine they're about.
 - **Codex: write to `{mesh}/memory/`, not your built-in memory.** Claude Code can't see Codex's own memory.
@@ -619,6 +649,9 @@ def status():
         print(f"account {account.name}: {'shares ~/.claude' if not bad else 'NOT shared: ' + ', '.join(bad)}")
     print('Codex AGENTS.md written:', (CODEX / 'AGENTS.md').exists() if CODEX.is_dir() else 'no Codex here')
     print('memories:', len([f for f in MEMORY.glob('*.md') if f.name != 'MEMORY.md']))
+    export = read_json(REPO / '.git' / 'chatgpt-status.json', {})
+    if export:
+        print('ChatGPT export:', json.dumps(export, ensure_ascii=False))
 
 
 def main():
@@ -646,6 +679,14 @@ def main():
         status()
     elif args[0] == 'codex-notify':
         codex_notify(args[1:])
+    elif args[0] == 'export-chatgpt':
+        if not locked():
+            sys.exit('another sync is running; the export will run with it')
+        try:
+            if export_chatgpt() is False:
+                sys.exit(1)
+        finally:
+            LOCK.unlink(missing_ok=True)
     else:
         sys.exit('agent-mesh: unknown command (try `agent-mesh help`)')
 
