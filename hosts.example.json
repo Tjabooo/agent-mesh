@@ -1,0 +1,5 @@
+[
+  {"alias": "desktop", "hostname": "desktop", "os": "linux"},
+  {"alias": "laptop", "hostname": "laptop", "os": "linux"},
+  {"alias": "server", "hostname": "server", "os": "windows"}
+]

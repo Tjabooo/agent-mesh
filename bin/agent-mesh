@@ -9,6 +9,8 @@ your machines, kept in step through a git repo you own (the "mesh", ~/.agent-mes
   agent-mesh sync --background   the same, detached (what the Claude Code hooks run)
   agent-mesh timer        also sync every 10 minutes (systemd user timer / Windows scheduled task)
   agent-mesh status       what is linked and whether this machine is in step
+  agent-mesh sessions     copy the other machines' Claude Code and Codex sessions here now (sync does it
+                          too, at most every 2 minutes), so `claude --resume` / `codex resume` list them
   agent-mesh export-chatgpt    publish opted-in conversations and memory to a private GitHub repo
   agent-mesh codex-notify [--then CMD...]   Codex's after-turn `notify` (set up by sync): syncs,
                           then runs the notify command that was there before
@@ -54,7 +56,8 @@ LOCK = REPO / '.git' / 'agent-mesh.lock'
 IMPORT_LINE = '@' + (('~/' + REPO.relative_to(HOME).as_posix()) if REPO.is_relative_to(HOME) else REPO.as_posix()) + '/AGENTS.md'
 # Settings every machine shares. Everything else in settings.json stays per machine (hooks, the
 # permission mode and allow list, machine paths).
-SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask')
+SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask',
+               'enableArtifact', 'disableClaudeAiConnectors', 'skillOverrides')
 CODEX_KEYS = ('model', 'model_reasoning_effort')
 MEMORY_INLINE = 12000  # characters of the newest memories copied into Codex's AGENTS.md; the rest it reads from the index
 HOST = socket.gethostname().lower()
@@ -355,7 +358,7 @@ def write_codex():
     # memories in full (the likeliest handovers); inlining everything cost every Codex turn ~13k tokens.
     memories, size = [], 0
     for f in sorted(MEMORY.glob('*.md'), key=lambda f: f.stat().st_mtime, reverse=True):
-        if f.name == 'MEMORY.md':
+        if f.name in ('MEMORY.md', 'MEMORY-archive.md'):  # indexes, not memories
             continue
         text = f.read_text(encoding='utf-8').strip()
         if size + len(text) > MEMORY_INLINE:
@@ -484,10 +487,24 @@ def sync():
         write_codex()
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
+        share_sessions()
         export_chatgpt()
         return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
     finally:
         LOCK.unlink(missing_ok=True)
+
+
+def share_sessions(force=False):
+    """Pull the other machines' chat sessions; a sleeping peer is skipped and tried next time."""
+    try:
+        from agent_mesh_sessions import share
+        result = share(REPO, log, force=force)
+        if result:
+            log(f'sessions: {result}')
+        return result
+    except Exception as error:
+        log(f'sessions failed (mesh sync completed): {error}')
+        return False
 
 
 def export_chatgpt():
@@ -573,9 +590,9 @@ def init(args):
     SHARED_CODEX.parent.mkdir(exist_ok=True)
     SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
                             + ''.join(l + '\n' for l in keep), encoding='utf-8')
-    shutil.copy2(TOOL, REPO / 'bin' / 'agent-mesh')
-    # The mesh's copy is what hooks and timers run, and it imports the exporter from beside itself.
-    shutil.copy2(TOOL.parent / 'agent_mesh_export.py', REPO / 'bin' / 'agent_mesh_export.py')
+    for tool in ('agent-mesh', 'agent_mesh_export.py', 'agent_mesh_sessions.py', 'cost'):  # the tools travel with the mesh
+        if (TOOL.parent / tool).exists():
+            shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
     (REPO / '.gitignore').write_text('__pycache__/\n*.pyc\n', encoding='utf-8')
     readme = TEMPLATE / 'README.md'
@@ -593,14 +610,15 @@ def init(args):
 
 
 def link_command():
-    """~/.local/bin/agent-mesh -> the mesh's own copy (Linux/macOS), if nothing is there yet."""
+    """~/.local/bin/{agent-mesh,cost} -> the mesh's own copies (Linux/macOS), if nothing is there yet."""
     if WINDOWS:
         return
-    command = HOME / '.local' / 'bin' / 'agent-mesh'
-    if not command.exists() and not command.is_symlink():
-        command.parent.mkdir(parents=True, exist_ok=True)
-        command.symlink_to(REPO / 'bin' / 'agent-mesh')
-        print(f'Linked {command}')
+    for name in ('agent-mesh', 'cost'):
+        command, target = HOME / '.local' / 'bin' / name, REPO / 'bin' / name
+        if target.exists() and not command.exists() and not command.is_symlink():
+            command.parent.mkdir(parents=True, exist_ok=True)
+            command.symlink_to(target)
+            print(f'Linked {command}')
 
 
 def timer():
@@ -686,6 +704,14 @@ def main():
         status()
     elif args[0] == 'codex-notify':
         codex_notify(args[1:])
+    elif args[0] == 'sessions':
+        if not locked():
+            sys.exit('another sync is running; try again in a moment')
+        try:
+            if share_sessions(force=True) is False:
+                sys.exit(1)
+        finally:
+            LOCK.unlink(missing_ok=True)
     elif args[0] == 'export-chatgpt':
         if not locked():
             sys.exit('another sync is running; the export will run with it')

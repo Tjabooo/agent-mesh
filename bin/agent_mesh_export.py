@@ -148,6 +148,15 @@ def parse_session(path, provider):
     return meta, messages
 
 
+def copied(path, home, foreign):
+    """True when every byte of a transcript came from another machine."""
+    try:
+        ranges = foreign.get(path.resolve().relative_to(home.resolve()).as_posix())
+        return bool(ranges) and sum(b - a for a, b in ranges) >= path.stat().st_size
+    except (ValueError, OSError):
+        return False
+
+
 def sources(home):
     roots = [('claude', home / '.claude' / 'projects'),
              ('codex', home / '.codex' / 'sessions'),
@@ -158,8 +167,11 @@ def sources(home):
               and not (p / 'projects').is_symlink()
               and not getattr(p / 'projects', 'is_junction', lambda: False)()]
     seen = set()
+    foreign = load(home / '.local' / 'state' / 'agent-mesh' / 'foreign-sessions.json', {})
     for provider, root in roots:
         for path in sorted(root.rglob('*.jsonl')) if root.exists() else []:
+            if copied(path, home, foreign):
+                continue  # copied in from the machine that ran it (agent-mesh sessions); it exports it
             if path.resolve() not in seen:
                 seen.add(path.resolve())
                 yield provider, path
