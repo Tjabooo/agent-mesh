@@ -15,42 +15,15 @@ or a bare repo on one of your machines.
 | `memory/` | The one memory. Every Claude Code project's memory folder (`~/.claude/projects/*/memory`) becomes a link to it (a junction on Windows). `MEMORY.md` is the index. Tell Codex in AGENTS.md to save memories here too. |
 | `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules, `enableArtifact`, `disableClaudeAiConnectors`, `skillOverrides`). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
 | `codex/config.toml` | Top-level Codex settings to share (`model`, `model_reasoning_effort`). |
-| `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
+| `bin/agent-mesh` | The tool itself (plus `agent_mesh_export.py` for the optional ChatGPT export), so a new machine needs only one clone. |
 | `bin/agent_mesh_sessions.py` | Copies the other machines’ Claude Code and Codex sessions here, so you can resume a chat on any machine (see below). |
 | `bin/cost` | `cost`: what all your Claude Code and Codex chats would have cost at API prices, across every machine (see below). |
 | `bin/token-audit` | `token-audit`: where the tokens go: fixed per-session overhead, cache breaks, biggest tool results, re-reads, images, subagents (see below). |
 | `hosts.json` (optional) | Your machines, for session sharing, `cost` and `token-audit` (copy `hosts.example.json`). |
 
 Logins, caches and plugins are never shared. Conversation text can optionally be exported to a
-separate private GitHub repository for ChatGPT; this is disabled until configured.
-
-## Read your agent data in normal ChatGPT conversations
-
-1. Create a **private** GitHub repository for your data and initialize it with a README.
-2. Copy `chatgpt.example.json` to `<mesh>/chatgpt.json`. Set `repository` to `owner/repo` and list
-   your machine hostnames under `hosts`. All machines need authenticated Git push access to it.
-3. Run `agent-mesh sync` on each machine. Future syncs publish automatically through the existing
-   Claude Code/Codex hooks and 10-minute timer. `agent-mesh export-chatgpt` retries just the export.
-4. In a regular chat on chatgpt.com, select the GitHub app and ask:
-   **Use GitHub to read START_HERE.md in owner/repo, then find the latest agent work on my topic.**
-   Give the GitHub app access to the private repository if your connection restricts repositories.
-
-The archive includes all available user/assistant conversation text (Claude Code, alternate
-accounts, Codex sessions and archived sessions), including older history. Shared memory,
-instructions and intentionally shared settings are copied too. Each machine owns its directory,
-with dates, source paths, indexes and small Markdown parts for long conversations. Direct file
-reads work before GitHub's search index catches up. This makes data available through the app;
-it does not insert chats into ChatGPT's history or automatically load all files into every chat.
-
-Login files, hidden reasoning, raw tool calls/results, and binary attachments are excluded.
-Recognizable tokens, private keys and password/key assignments are redacted from text. Redaction
-is best effort: conversations can still contain personal or sensitive information. The exporter
-refuses a publicly visible destination; keep the archive private. Removing a local session removes
-its current exported files, while previous Git commits retain old versions.
-
-`agent-mesh status` reports counts and the last export result. If GitHub is unavailable, local
-mesh sync still completes and the archive retries next time. Export checkouts and incremental
-caches stay under the mesh's `.git/` directory. To stop publishing, set `enabled` to `false`.
+separate private GitHub repository for ChatGPT ([see below](#optional-read-your-agent-data-in-chatgpt));
+this is off until configured.
 
 ## Resume a chat on another machine
 
@@ -78,7 +51,9 @@ hooks sync after every reply.
 - **Claude Code**: hooks run `agent-mesh sync --background` at the start of every session and after
   every reply.
 - **Codex**: its after-turn `notify` command runs a sync, then whatever notify command you had before.
-- **A 10-minute timer** (`agent-mesh timer`) for changes made outside the agents.
+- **A 10-minute timer** (`agent-mesh timer`) for changes made outside the agents: a systemd user
+  timer on Linux, a Task Scheduler task on Windows. Without systemd (e.g. macOS), run
+  `agent-mesh sync` from cron or launchd instead.
 - **By hand**: `agent-mesh sync`. `agent-mesh status` shows whether this machine is in step.
 
 A sync commits this machine's changes, pulls and merges the others', pushes, and then applies the
@@ -215,6 +190,18 @@ git clone -u "powershell git-upload-pack" -c remote.origin.uploadpack="powershel
   -c remote.origin.receivepack="powershell git-receive-pack" myserver:C:/Users/me/agent-mesh.git ~/.agent-mesh
 ```
 
+## Commands
+
+```text
+agent-mesh init [--origin URL]   make a new mesh in ~/.agent-mesh (once, on your first machine)
+agent-mesh setup                 on each machine after init or a clone: link memory, import AGENTS.md, add hooks
+agent-mesh sync [--background]   commit this machine's changes, merge the others', push, apply locally
+agent-mesh timer                 also sync every 10 minutes
+agent-mesh status                what is linked and whether this machine is in step
+agent-mesh export-chatgpt        retry just the ChatGPT export
+agent-mesh codex-notify          Codex's after-turn notify command (set up by sync)
+```
+
 ## Two Claude accounts, one agent
 
 If you run a second Claude login with `CLAUDE_CONFIG_DIR=~/.claude-2 claude` (for example, to switch
@@ -229,6 +216,36 @@ newer version and relinks it. The older copy goes to `.git/account-backups/`. On
 files are copies kept in step, because a file symlink needs admin rights there; folders are
 junctions.
 
+## Optional: read your agent data in ChatGPT
+
+1. Create a **private** GitHub repository for your data and initialize it with a README.
+2. Copy `chatgpt.example.json` to `<mesh>/chatgpt.json`. Set `repository` to `owner/repo` and list
+   your machine hostnames under `hosts`. All machines need authenticated Git push access to it.
+   The export code is `bin/agent_mesh_export.py`; `init` copies it into the mesh. If your mesh is
+   older than that, copy it into `<mesh>/bin/` yourself.
+3. Run `agent-mesh sync` on each machine. Future syncs publish automatically through the existing
+   Claude Code/Codex hooks and 10-minute timer. `agent-mesh export-chatgpt` retries just the export.
+4. In a regular chat on chatgpt.com, select the GitHub app and ask:
+   **Use GitHub to read START_HERE.md in owner/repo, then find the latest agent work on my topic.**
+   Give the GitHub app access to the private repository if your connection restricts repositories.
+
+The archive includes all available user/assistant conversation text (Claude Code, alternate
+accounts, Codex sessions and archived sessions), including older history. Shared memory,
+instructions and intentionally shared settings are copied too. Each machine owns its directory,
+with dates, source paths, indexes and small Markdown parts for long conversations. Direct file
+reads work before GitHub's search index catches up. This makes data available through the app;
+it does not insert chats into ChatGPT's history or automatically load all files into every chat.
+
+Login files, hidden reasoning, raw tool calls/results, and binary attachments are excluded.
+Recognizable tokens, private keys and password/key assignments are redacted from text. Redaction
+is best effort: conversations can still contain personal or sensitive information. The exporter
+refuses a publicly visible destination; keep the archive private. Removing a local session removes
+its current exported files, while previous Git commits retain old versions.
+
+`agent-mesh status` reports counts and the last export result. If GitHub is unavailable, local
+mesh sync still completes and the archive retries next time. Export checkouts and incremental
+caches stay under the mesh's `.git/` directory. To stop publishing, set `enabled` to `false`.
+
 ## Tips for AGENTS.md
 
 The starter file has sections that worked well in practice:
@@ -240,6 +257,12 @@ The starter file has sections that worked well in practice:
 - **My machines**: names, OS, how to reach each one (SSH aliases).
 - **What lives where**: each project's source of truth, how to deploy or restart it.
 
+## Development
+
+```sh
+python -m unittest discover -s tests -v
+```
+
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

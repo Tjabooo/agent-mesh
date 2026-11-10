@@ -513,6 +513,11 @@ def export_chatgpt():
         return
     try:
         from agent_mesh_export import publish
+    except ImportError:
+        log('ChatGPT export skipped: bin/agent_mesh_export.py is missing from the mesh '
+            '(copy it there from the agent-mesh repo)')
+        return False
+    try:
         result = publish(REPO)
         if result:
             log(f'ChatGPT export: {result["conversations"]} conversations, '
