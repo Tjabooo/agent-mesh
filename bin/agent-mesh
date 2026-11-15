@@ -11,7 +11,6 @@ machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by 
   agent-mesh status       what is linked and whether this machine is in step
   agent-mesh sessions     copy the other machines' Claude Code sessions here now (sync does it too,
                           at most every 2 minutes), so `claude --resume` lists them
-  agent-mesh export-chatgpt    publish opted-in conversations and memory to a private GitHub repo
 
 Extra Claude Code accounts (e.g. `CLAUDE_CONFIG_DIR=~/.claude-2 claude`) are any ~/.claude-<name>
 folders: sync points their CLAUDE.md, settings, skills, plugins and projects (memory) at ~/.claude.
@@ -384,7 +383,6 @@ def sync():
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
         share_sessions()
-        export_chatgpt()
         return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
     finally:
         LOCK.unlink(missing_ok=True)
@@ -401,26 +399,6 @@ def share_sessions(force=False):
     except Exception as error:
         log(f'sessions failed (mesh sync completed): {error}')
         return False
-
-
-def export_chatgpt():
-    """An archive outage must not prevent local memory/settings from being applied."""
-    if not (REPO / 'chatgpt.json').exists():
-        return
-    try:
-        from agent_mesh_export import publish
-        result = publish(REPO)
-        if result:
-            log(f'ChatGPT export: {result["conversations"]} conversations, '
-                f'{result["messages"]} messages, {len(result["errors"])} errors')
-    except Exception as error:
-        from agent_mesh_export import redact, utc
-        status = read_json(REPO / '.git' / 'chatgpt-status.json', {})
-        status.update({'ok': False, 'checked_at': utc(), 'error': redact(str(error))[:400]})
-        write_json(REPO / '.git' / 'chatgpt-status.json', status)
-        log(f'ChatGPT export failed (mesh sync completed): {status["error"]}')
-        return False
-    return True
 
 
 def track_origin():
@@ -474,7 +452,7 @@ def init(args):
     (MEMORY / 'MEMORY.md').write_text('', encoding='utf-8')
     # Start from this machine's settings, so the first sync doesn't take away what you already set.
     write_json(SHARED_SETTINGS, subset(read_json(CLAUDE / 'settings.json', {})))
-    for tool in ('agent-mesh', 'agent_mesh_export.py', 'agent_mesh_sessions.py', 'cost'):  # the tools travel with the mesh
+    for tool in ('agent-mesh', 'agent_mesh_sessions.py', 'cost'):  # the tools travel with the mesh
         if (TOOL.parent / tool).exists():
             shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
@@ -557,9 +535,6 @@ def status():
             is_link(account / n) or (account / n).is_file() and (account / n).read_bytes() == (CLAUDE / n).read_bytes())]
         print(f"account {account.name}: {'shares ~/.claude' if not bad else 'NOT shared: ' + ', '.join(bad)}")
     print('memories:', len([f for f in MEMORY.glob('*.md') if f.name != 'MEMORY.md']))
-    export = read_json(REPO / '.git' / 'chatgpt-status.json', {})
-    if export:
-        print('ChatGPT export:', json.dumps(export, ensure_ascii=False))
 
 
 def main():
@@ -590,14 +565,6 @@ def main():
             sys.exit('another sync is running; try again in a moment')
         try:
             if share_sessions(force=True) is False:
-                sys.exit(1)
-        finally:
-            LOCK.unlink(missing_ok=True)
-    elif args[0] == 'export-chatgpt':
-        if not locked():
-            sys.exit('another sync is running; the export will run with it')
-        try:
-            if export_chatgpt() is False:
                 sys.exit(1)
         finally:
             LOCK.unlink(missing_ok=True)

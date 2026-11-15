@@ -26,8 +26,8 @@ WINDOWS = sys.platform == 'win32'
 ROOTS = (('.claude/projects', {'memory'}),)  # memory is shared by the mesh itself
 MAX_FILE = 200 * 1024 * 1024
 PAUSE = 120  # seconds between automatic pulls (the hooks sync after every reply)
-# Byte ranges of each file that came from another machine, so `cost`, `token-audit` and the ChatGPT
-# export count a session once, on the machine that ran it: {"<path under home>": [[start, end], ...]}
+# Byte ranges of each file that came from another machine, so `cost` and `token-audit`
+# count a session once, on the machine that ran it: {"<path under home>": [[start, end], ...]}
 LEDGER = Path('.local') / 'state' / 'agent-mesh' / 'foreign-sessions.json'
 
 

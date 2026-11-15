@@ -13,7 +13,7 @@ nothing has to be installed there.
 Machines come from the first of $COST_HOSTS_FILE, hosts.json in the mesh, ~/.config/cost/hosts.json
 or ~/.config/archfleet/hosts.json: a JSON list of {"alias": ssh alias, "hostname": name,
 "os": "linux"|"windows"} (see hosts.example.json). This machine is skipped by its hostname.
-Subscription plans (Pro/Max, ChatGPT Plus) don't bill per token: the figure is what the same
+Subscription plans (Pro/Max) don't bill per token: the figure is what the same
 usage would cost on the API, like the "cost" line in Claude Code's /usage.
 """
 import argparse
