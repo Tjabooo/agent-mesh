@@ -1,5 +1,5 @@
-"""Share Claude Code and Codex chat sessions between machines, so `claude --resume` and `codex resume`
-on one machine also list the sessions you ran on the others.
+"""Share Claude Code chat sessions between machines, so `claude --resume` on one machine also lists
+the sessions you ran on the others.
 
 Each machine pulls from its peers (same OS only: a session remembers its working folder, and a
 Windows path means nothing on Linux). Session files are append-only JSONL, so a file is copied when
@@ -23,8 +23,7 @@ from pathlib import Path
 HOME = Path.home()
 WINDOWS = sys.platform == 'win32'
 # (folder under the home, what to skip inside it)
-ROOTS = (('.claude/projects', {'memory'}), ('.codex/sessions', set()))  # memory is shared by the mesh itself
-CODEX_INDEX = '.codex/session_index.jsonl'  # thread names, one JSON line per rename
+ROOTS = (('.claude/projects', {'memory'}),)  # memory is shared by the mesh itself
 MAX_FILE = 200 * 1024 * 1024
 PAUSE = 120  # seconds between automatic pulls (the hooks sync after every reply)
 # Byte ranges of each file that came from another machine, so `cost`, `token-audit` and the ChatGPT
@@ -66,16 +65,13 @@ def manifest(home=HOME):
                     continue
                 if st.st_size <= MAX_FILE:
                     out[p.relative_to(home).as_posix()] = [st.st_size, int(st.st_mtime)]
-    index = home / CODEX_INDEX
-    if index.is_file():
-        out[CODEX_INDEX] = [index.stat().st_size, int(index.stat().st_mtime)]
     return out
 
 
 def plan(local, remote):
     """Which of the peer's files might hold something new: missing here, or longer there."""
     return sorted(rel for rel, (size, _) in remote.items()
-                  if rel not in local or size > local[rel][0] or rel == CODEX_INDEX and size != local[rel][0])
+                  if rel not in local or size > local[rel][0])
 
 
 def whole_lines(data):
@@ -83,33 +79,11 @@ def whole_lines(data):
     return data[:cut + 1] if cut >= 0 else b''
 
 
-def merge_index(here, there):
-    """Union of the two thread-name logs, oldest first (Codex reads the last entry per thread)."""
-    seen, rows = set(), []
-    for line in (here + there).splitlines():
-        if line.strip() and line not in seen:
-            seen.add(line)
-            try:
-                when = json.loads(line).get('updated_at') or ''
-            except ValueError:
-                when = ''
-            rows.append((when, line))
-    rows.sort(key=lambda r: r[0])
-    return b''.join(line + b'\n' for _, line in rows)
-
-
 def apply(rel, data, mtime, home=HOME, foreign=None):
     """Bring one file up to the peer's copy. Returns 'new', 'grown', 'same' or 'diverged'.
     The bytes it adds are noted in `foreign` (the ledger)."""
     path = home / rel
     foreign = {} if foreign is None else foreign
-    if rel == CODEX_INDEX:
-        old = path.read_bytes() if path.exists() else b''
-        merged = merge_index(old, data)
-        if merged == old:
-            return 'same'
-        write_new(path, merged, None)
-        return 'grown'
     data = whole_lines(data)
     if not data:
         return 'same'

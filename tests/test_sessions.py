@@ -54,15 +54,6 @@ class Apply(unittest.TestCase):
         self.apply(b'{"a":1}\n{"b":2}\n')
         self.assertEqual(self.apply(b'{"a":1}\n'), 'same')
 
-    def test_codex_thread_names_merge(self):
-        index = self.home / s.CODEX_INDEX
-        index.parent.mkdir(parents=True)
-        index.write_bytes(b'{"id":"1","thread_name":"x","updated_at":"2026-02"}\n')
-        self.apply(b'{"id":"2","thread_name":"y","updated_at":"2026-01"}\n', rel=s.CODEX_INDEX)
-        self.assertEqual(index.read_bytes().splitlines(),
-                         [b'{"id":"2","thread_name":"y","updated_at":"2026-01"}',
-                          b'{"id":"1","thread_name":"x","updated_at":"2026-02"}'])
-
 
 class Plan(unittest.TestCase):
     def test_wants_missing_and_longer_files_only(self):
@@ -76,9 +67,7 @@ class Plan(unittest.TestCase):
             (home / '.claude/projects/p/memory').mkdir(parents=True)
             (home / '.claude/projects/p/memory/MEMORY.md').write_text('x')
             (home / '.claude/projects/p/s.jsonl').write_text('{}\n')
-            (home / '.codex/sessions/2026/01').mkdir(parents=True)
-            (home / '.codex/sessions/2026/01/r.jsonl').write_text('{}\n')
-            self.assertEqual(sorted(s.manifest(home)), ['.claude/projects/p/s.jsonl', '.codex/sessions/2026/01/r.jsonl'])
+            self.assertEqual(sorted(s.manifest(home)), ['.claude/projects/p/s.jsonl'])
 
 
 class Ledger(unittest.TestCase):

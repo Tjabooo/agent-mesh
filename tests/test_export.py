@@ -26,8 +26,7 @@ class ExportTests(unittest.TestCase):
         (self.mesh / 'memory/example.md').write_text('Latest project handover')
 
     def session(self, provider, records, name='session.jsonl'):
-        directory = '.claude/projects/project' if provider == 'claude' else '.codex/sessions'
-        path = self.home / directory / name
+        path = self.home / '.claude/projects/project' / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
         return path
@@ -56,23 +55,6 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn('hidden reasoning', text)
         self.assertNotIn('tool credential', text)
         self.assertNotIn('tool output secret', text)
-
-    def test_codex_roles_phase_dedup_and_injected_context(self):
-        def msg(role, text, key, phase=None):
-            return {'type': 'response_item', 'timestamp': '2026-11-05T01:00:00Z', 'payload': {
-                'type': 'message', 'role': role, 'id': key, 'phase': phase,
-                'content': [{'type': 'input_text', 'text': text}]}}
-        records = [msg('developer', 'injected system config', 'd'),
-                   msg('user', '# AGENTS.md instructions\n<INSTRUCTIONS>private rules</INSTRUCTIONS>\n'
-                       '<environment_context>environment</environment_context>\nFix sync', 'u'),
-                   msg('assistant', 'private analysis', 'a', 'analysis'),
-                   msg('assistant', 'Done', 'b', 'final_answer')]
-        records.append(records[-1])
-        meta, messages = export.parse_session(self.session('codex', records), 'codex')
-        self.assertEqual(meta['messages'], 2)
-        self.assertEqual(meta['title'], 'Fix sync')
-        self.assertNotIn('private rules', ''.join(messages))
-        self.assertNotIn('private analysis', ''.join(messages))
 
     def test_long_messages_split_without_loss_and_indexes_resolve(self):
         text = 'visible conversation ' * 5000
@@ -104,13 +86,6 @@ class ExportTests(unittest.TestCase):
         stats = export.render_export(self.mesh, self.home, self.checkout, 'computer', [])
         self.assertEqual(stats['conversations'], 0)
         self.assertFalse(list((self.checkout / 'machines/computer/conversations').rglob('part-*.md')))
-
-    def test_old_codex_event_format(self):
-        path = self.session('codex', [{'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'Help me'}},
-                                      {'type': 'event_msg', 'payload': {'type': 'agent_message', 'message': 'Done'}}])
-        meta, messages = export.parse_session(path, 'codex')
-        self.assertEqual(meta['messages'], 2)
-        self.assertIn('Done', ''.join(messages))
 
     def test_public_repository_rejected_and_private_accepted(self):
         from io import BytesIO

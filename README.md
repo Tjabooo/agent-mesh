@@ -1,9 +1,8 @@
 # agent-mesh
 
-One brain for your coding agents across all your machines. **Claude Code** and **Codex** get the
-same instructions, the same memory and the same settings on every computer. A memory saved on your
-laptop is there when you continue on your desktop, and so is a rule you gave Codex when Claude Code
-picks up the work.
+One brain for Claude Code across all your machines: the same instructions, the same memory and the
+same settings on every computer. A memory saved on your laptop is there when you continue on your
+desktop.
 
 It's a small Python script (standard library only) and a git repo you own: the **mesh**. Each
 machine keeps a clone in `~/.agent-mesh`, and syncs through any git remote: a private GitHub repo,
@@ -11,13 +10,12 @@ or a bare repo on one of your machines.
 
 | In the mesh | How each machine uses it |
 | --- | --- |
-| `AGENTS.md` | Every agent's instructions. Claude Code imports it (`~/.claude/CLAUDE.md` starts with `@~/.agent-mesh/AGENTS.md`; anything below stays local to that machine). Codex gets a copy as `~/.codex/AGENTS.md`, with the memory index and the newest memories inline; older memories are read on demand. |
-| `memory/` | The one memory. Every Claude Code project's memory folder (`~/.claude/projects/*/memory`) becomes a link to it (a junction on Windows). `MEMORY.md` is the index. Tell Codex in AGENTS.md to save memories here too. |
+| `AGENTS.md` | Every agent's instructions. Claude Code imports it (`~/.claude/CLAUDE.md` starts with `@~/.agent-mesh/AGENTS.md`; anything below stays local to that machine). |
+| `memory/` | The one memory. Every Claude Code project's memory folder (`~/.claude/projects/*/memory`) becomes a link to it (a junction on Windows). `MEMORY.md` is the index. |
 | `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules, `enableArtifact`, `disableClaudeAiConnectors`, `skillOverrides`). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
-| `codex/config.toml` | Top-level Codex settings to share (`model`, `model_reasoning_effort`). |
 | `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
-| `bin/agent_mesh_sessions.py` | Copies the other machines’ Claude Code and Codex sessions here, so you can resume a chat on any machine (see below). |
-| `bin/cost` | `cost`: what all your Claude Code and Codex chats would have cost at API prices, across every machine (see below). |
+| `bin/agent_mesh_sessions.py` | Copies the other machines’ Claude Code sessions here, so you can resume a chat on any machine (see below). |
+| `bin/cost` | `cost`: what all your Claude Code chats would have cost at API prices, across every machine (see below). |
 | `bin/token-audit` | `token-audit`: where the tokens go: fixed per-session overhead, cache breaks, biggest tool results, re-reads, images, subagents (see below). |
 | `hosts.json` (optional) | Your machines, for session sharing, `cost` and `token-audit` (copy `hosts.example.json`). |
 
@@ -30,13 +28,13 @@ separate private GitHub repository for ChatGPT; this is disabled until configure
 2. Copy `chatgpt.example.json` to `<mesh>/chatgpt.json`. Set `repository` to `owner/repo` and list
    your machine hostnames under `hosts`. All machines need authenticated Git push access to it.
 3. Run `agent-mesh sync` on each machine. Future syncs publish automatically through the existing
-   Claude Code/Codex hooks and 10-minute timer. `agent-mesh export-chatgpt` retries just the export.
+   Claude Code hooks and 10-minute timer. `agent-mesh export-chatgpt` retries just the export.
 4. In a regular chat on chatgpt.com, select the GitHub app and ask:
    **Use GitHub to read START_HERE.md in owner/repo, then find the latest agent work on my topic.**
    Give the GitHub app access to the private repository if your connection restricts repositories.
 
-The archive includes all available user/assistant conversation text (Claude Code, alternate
-accounts, Codex sessions and archived sessions), including older history. Shared memory,
+The archive includes all available user/assistant conversation text (Claude Code and alternate
+accounts), including older history. Shared memory,
 instructions and intentionally shared settings are copied too. Each machine owns its directory,
 with dates, source paths, indexes and small Markdown parts for long conversations. Direct file
 reads work before GitHub's search index catches up. This makes data available through the app;
@@ -54,9 +52,9 @@ caches stay under the mesh's `.git/` directory. To stop publishing, set `enabled
 
 ## Resume a chat on another machine
 
-Every sync also copies the other machines' Claude Code and Codex sessions to this one
-(`~/.claude/projects/**` and `~/.codex/sessions/**`, plus Codex's thread names). So a chat you ran
-on the laptop shows up in `claude --resume` or `codex resume` on the desktop, and you carry on there.
+Every sync also copies the other machines' Claude Code sessions to this one
+(`~/.claude/projects/**`). So a chat you ran on the laptop shows up in `claude --resume` on the
+desktop, and you carry on there.
 `agent-mesh sessions` does it right away. Automatic pulls run at most every 2 minutes, because the
 hooks sync after every reply.
 
@@ -77,7 +75,6 @@ hooks sync after every reply.
 
 - **Claude Code**: hooks run `agent-mesh sync --background` at the start of every session and after
   every reply.
-- **Codex**: its after-turn `notify` command runs a sync, then whatever notify command you had before.
 - **A 10-minute timer** (`agent-mesh timer`) for changes made outside the agents.
 - **By hand**: `agent-mesh sync`. `agent-mesh status` shows whether this machine is in step.
 
@@ -107,33 +104,30 @@ cache-read tokens. Other machines run their own copy from `~/.agent-mesh/bin` ov
 
 ## What your agents cost
 
-`cost` adds up every Claude Code and Codex conversation on all your machines and prices each API
-call at the published per-token rates: the same idea as the "cost" line in Claude Code's `/usage`,
-but for both agents and every computer at once. On a subscription (Claude Pro/Max, ChatGPT Plus)
-nothing is billed per token, so read it as "what this would have cost on the API".
+`cost` adds up every Claude Code conversation on all your machines and prices each API call at the
+published per-token rates: the same idea as the "cost" line in Claude Code's `/usage`, but for every
+account and computer at once. On a subscription (Claude Pro/Max) nothing is billed per token, so read it as "what this would have cost on the API".
 
 ```
  AI spend · API-equivalent · 3 machines                         2026-11-05 13:12
  ────────────────────────────────────────────────────────────────
- Total                        $629.14   since 2026-10-31 · 6 days · $104.86/day
+ Total                        $566.03   since 2026-10-31 · 6 days · $94.34/day
  Today               $121.48
- Last 7 days         $629.14
+ Last 7 days         $566.03
 
  By agent
-   Claude Code             $566.03    90%  ██████████████████
-   Codex                    $63.10    10%  ██
+   Claude Code             $566.03   100%  ██████████████████
 
  By machine
-   desktop                 $318.13    51%  ██████████████████
-   laptop                  $247.25    39%  █████████████▌
-   server                   $63.75    10%  ███▌
+   desktop                 $318.13    56%  ██████████████████
+   laptop                  $247.25    44%  ██████████████
+   server                    $0.65     0%  
 
  By model               calls    input  cache rd   output       cost
    claude-opus-5-5         6.7k    16.9M      1.5B     6.4M    $565.13
-   gpt-6.1-sol             1.6k     5.4M    242.1M     1.2M     $57.19
 
  Cache    99% of input read from cache · saved $6,373.65 (would be $7,002.79 uncached)
- Activity 107 sessions · 8.4k API calls · 6 active days · $5.88/session
+ Activity 107 sessions · 6.7k API calls · 6 active days · $5.29/session
 ```
 
 It also lists the priciest sessions (by their titles) and a bar per day.
@@ -148,7 +142,7 @@ cost --json           # the raw numbers
 ```
 
 How it works: it reads the transcripts the agents already keep (`~/.claude/projects/**/*.jsonl`,
-including subagents, and `~/.codex/sessions/**/*.jsonl`), takes the token usage of each API call
+including subagents), takes the token usage of each API call
 (counting a message only once when a transcript is forked or resumed), and prices it with the table
 at the top of `bin/cost`: input, output, cache writes (5-minute and 1-hour) and cache reads, fast
 mode, and long-prompt rates. The Claude prices match the `costUSD` Claude Code records itself. A
@@ -182,7 +176,7 @@ agent-mesh timer
 
 `init` creates `~/.agent-mesh` with a starter `AGENTS.md`, moves your existing Claude Code project
 memories into it, takes the shared settings from this machine (so nothing you've set is lost), wires
-up Claude Code and Codex, and pushes. Then fill in `~/.agent-mesh/AGENTS.md`: who you are, your
+up Claude Code, and pushes. Then fill in `~/.agent-mesh/AGENTS.md`: who you are, your
 machines, where your projects live, and how you like agents to work.
 
 **Every other machine:**

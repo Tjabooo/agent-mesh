@@ -45,12 +45,6 @@ class PriceTests(unittest.TestCase):
         self.assertEqual(cost.claude_price('claude-opus-5-5', u, 'fast')[0], 8)
         self.assertIsNone(cost.claude_price('claude-unknown-9', u, None)[0])
 
-    def test_codex_long_context(self):
-        short = {'input_tokens': 200_000, 'cached_input_tokens': 100_000, 'output_tokens': 1000}
-        self.assertAlmostEqual(cost.codex_price('gpt-6.1-sol', short, 'default')[0], 0.2 + 0.01 + 0.01)
-        long = dict(short, input_tokens=300_000)
-        self.assertAlmostEqual(cost.codex_price('gpt-6.1-sol', long, 'default')[0], 0.8 + 0.02 + 0.015)
-
 
 class ScanTests(unittest.TestCase):
     def setUp(self):
@@ -72,24 +66,6 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(sum(r['calls'] for r in rows), 3)
         self.assertEqual({r['session'] for r in rows}, {'s1'})
         self.assertEqual({r['title'] for r in rows}, {'Fix it'})
-
-    def test_codex_uses_turn_models(self):
-        write_jsonl(self.home / '.codex/session_index.jsonl',
-                    [{'id': 'th1', 'thread_name': 'Codex job'}])
-        usage = {'input_tokens': 1000, 'cached_input_tokens': 600, 'output_tokens': 50, 'reasoning_output_tokens': 10}
-        write_jsonl(self.home / '.codex/sessions/2026/01/01/rollout-x.jsonl', [
-            {'type': 'session_meta', 'payload': {'id': 'th1'}},
-            {'type': 'turn_context', 'payload': {'turn_id': 't1', 'model': 'gpt-6-astra'}},
-            {'type': 'token_usage_record', 'timestamp': TODAY, 'payload': {'turn_id': 't1', 'response_id': 'r1', 'session_id': 'th1', 'usage': usage}},
-            {'type': 'turn_context', 'payload': {'turn_id': 't2', 'model': 'gpt-6.1-sol'}},
-            {'type': 'token_usage_record', 'timestamp': TODAY, 'payload': {'turn_id': 't2', 'response_id': 'r2', 'session_id': 'th1', 'usage': usage}},
-            {'type': 'token_usage_record', 'timestamp': TODAY, 'payload': {'turn_id': 't2', 'response_id': 'r2', 'session_id': 'th1', 'usage': usage}},
-            {'type': 'event_msg', 'timestamp': TODAY, 'payload': {'type': 'token_count', 'info': {'last_token_usage': usage, 'total_token_usage': usage}}},
-        ])
-        rows = cost.scan()
-        self.assertEqual({r['model']: r['calls'] for r in rows}, {'gpt-6-astra': 1, 'gpt-6.1-sol': 1})
-        astra = next(r for r in rows if r['model'] == 'gpt-6-astra')
-        self.assertEqual((astra['input'], astra['cache_read'], astra['title']), (400, 600, 'Codex job'))
 
     def test_report(self):
         write_jsonl(self.home / '.claude/projects/p/s1.jsonl', [claude_msg('msg_a')])

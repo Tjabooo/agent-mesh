@@ -74,17 +74,12 @@ def blocks(content):
 
 
 def clean_user(text):
-    # Codex stores its injected instructions/environment as user records. They are archived
-    # separately in shared/, not repeated in every conversation as though the person said them.
-    text = re.sub(r'^# AGENTS\.md instructions\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>\s*', '', text, flags=re.S)
-    text = re.sub(r'<environment_context>.*?</environment_context>', '', text, flags=re.S)
-    text = re.sub(r'<external_codex_apps_open_page>.*?</external_codex_apps_open_page>', '', text, flags=re.S)
     text = re.sub(r'<(?:system-reminder|local-command-caveat)>.*?</(?:system-reminder|local-command-caveat)>', '', text, flags=re.S)
     return text.strip()
 
 
 def parse_session(path, provider):
-    messages, seen, fallback = [], set(), []
+    messages, seen = [], set()
     meta = {'id': path.stem, 'project': '', 'title': '', 'updated': '', 'messages': 0}
     with path.open(encoding='utf-8', errors='replace') as stream:
         for line in stream:
@@ -96,35 +91,15 @@ def parse_session(path, provider):
                 continue
             stamp = obj.get('timestamp', '')
             role, text, key = '', '', ''
-            if provider == 'claude':
-                if obj.get('type') == 'ai-title':
-                    meta['title'] = obj.get('aiTitle', '')
-                meta['project'] = obj.get('cwd') or meta['project']
-                meta['id'] = obj.get('sessionId') or meta['id']
-                if obj.get('type') not in ('user', 'assistant') or obj.get('isMeta'):
-                    continue
-                msg = obj.get('message', {})
-                role, text = msg.get('role', ''), blocks(msg.get('content'))
-                key = obj.get('uuid', '')
-            else:
-                payload = obj.get('payload', {})
-                if not isinstance(payload, dict):
-                    continue
-                if obj.get('type') == 'session_meta':
-                    meta['id'] = payload.get('id') or payload.get('session_id') or meta['id']
-                    meta['project'] = payload.get('cwd', '')
-                if obj.get('type') == 'event_msg' and payload.get('type') in ('user_message', 'agent_message'):
-                    role = 'user' if payload['type'] == 'user_message' else 'assistant'
-                    text = clean_user(payload.get('message', '')) if role == 'user' else payload.get('message', '')
-                    if text:
-                        fallback.append((role, stamp, redact(text)))
-                if obj.get('type') != 'response_item' or payload.get('type') != 'message':
-                    continue
-                role = payload.get('role', '')
-                if payload.get('channel') == 'analysis' or payload.get('phase') == 'analysis':
-                    continue
-                text = blocks(payload.get('content'))
-                key = payload.get('id', '')
+            if obj.get('type') == 'ai-title':
+                meta['title'] = obj.get('aiTitle', '')
+            meta['project'] = obj.get('cwd') or meta['project']
+            meta['id'] = obj.get('sessionId') or meta['id']
+            if obj.get('type') not in ('user', 'assistant') or obj.get('isMeta'):
+                continue
+            msg = obj.get('message', {})
+            role, text = msg.get('role', ''), blocks(msg.get('content'))
+            key = obj.get('uuid', '')
             if role not in ('user', 'assistant'):
                 continue
             text = clean_user(text) if role == 'user' else text.strip()
@@ -132,12 +107,6 @@ def parse_session(path, provider):
                 continue
             seen.add((key, text))
             text = redact(text)
-            if not meta['title'] and role == 'user':
-                meta['title'] = ' '.join(text.split())[:180]
-            meta['updated'] = stamp or meta['updated']
-            messages.append(f'## {role.title()} — {stamp or "undated"}\n\n{text}\n\n')
-    if not messages:
-        for role, stamp, text in fallback:
             if not meta['title'] and role == 'user':
                 meta['title'] = ' '.join(text.split())[:180]
             meta['updated'] = stamp or meta['updated']
@@ -158,9 +127,7 @@ def copied(path, home, foreign):
 
 
 def sources(home):
-    roots = [('claude', home / '.claude' / 'projects'),
-             ('codex', home / '.codex' / 'sessions'),
-             ('codex', home / '.codex' / 'archived_sessions')]
+    roots = [('claude', home / '.claude' / 'projects')]
     # Include independent alternate accounts, but don't traverse their links to the main account.
     roots += [('claude', p / 'projects') for p in home.glob('.claude-*')
               if p.is_dir() and not p.is_symlink() and not getattr(p, 'is_junction', lambda: False)()
@@ -238,8 +205,7 @@ def render_export(mesh, home, checkout, host, hosts):
         if path.relative_to(target).as_posix() not in expected:
             path.unlink()
     shared = target / 'shared'
-    allow = [mesh / 'AGENTS.md', mesh / 'codex' / 'AGENTS.codex.md',
-             mesh / 'claude' / 'settings.json', mesh / 'codex' / 'config.toml',
+    allow = [mesh / 'AGENTS.md', mesh / 'claude' / 'settings.json',
              *sorted((mesh / 'memory').glob('*.md'))]
     shared_files = []
     for source in allow:
@@ -266,7 +232,7 @@ def render_export(mesh, home, checkout, host, hosts):
                'Use current shared memory for decisions and status; conversations supply detail.\n\n')
     if errors:
         heading += 'Export errors (retry at next sync):\n' + '\n'.join('- ' + e for e in errors) + '\n\n'
-    for provider in ('claude', 'codex'):
+    for provider in ('claude',):
         items = [m for m in catalog if m['provider'] == provider]
         lines = [f'# {host}: {provider} conversations\n\n']
         for m in items:
