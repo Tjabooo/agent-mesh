@@ -15,6 +15,7 @@ or a bare repo on one of your machines.
 | `claude/settings.json` | Claude Code settings every machine shares (theme, model effort, auto-compact, permission deny/ask rules, `enableArtifact`, `disableClaudeAiConnectors`, `skillOverrides`). These sync both ways with `~/.claude/settings.json`: change one anywhere and it changes everywhere. Hooks, the permission mode and the allow list stay per machine. |
 | `bin/agent-mesh` | The tool itself, so a new machine needs only one clone. |
 | `bin/agent_mesh_sessions.py` | Copies the other machines’ Claude Code sessions here, so you can resume a chat on any machine (see below). |
+| `bin/browser_handoff.py` | Your Firefox windows follow you between machines: continue on one where you left off on another, scroll positions included (see below). |
 | `bin/cost` | `cost`: what all your Claude Code chats would have cost at API prices, across every machine (see below). |
 | `bin/token-audit` | `token-audit`: where the tokens go: fixed per-session overhead, cache breaks, biggest tool results, re-reads, images, subagents (see below). |
 | `hosts.json` (optional) | Your machines, for session sharing, `cost` and `token-audit` (copy `hosts.example.json`). |
@@ -41,6 +42,28 @@ hooks sync after every reply.
   it's left alone on both and logged in `.git/agent-mesh.log`.
 - Copied bytes are listed in `~/.local/state/agent-mesh/foreign-sessions.json`. `cost`,
   and `token-audit` skip them, so each chat is counted on the machine that ran it.
+
+## Continue browsing on another machine (browser-handoff)
+Your Firefox windows follow you between machines the way chats do. Close the laptop, sit down at the
+desktop, run `browser-handoff pick` (bound to a key, e.g. SUPER+SHIFT+T) and pick "Continue from
+<laptop>": its windows open here with every tab's back/forward history, scroll position and typed form text.
+
+- **Sending.** Firefox saves its session to `sessionstore-backups/recovery.jsonlz4` every 15 seconds.
+  On Linux the `browser-handoff` user service watches that file and copies a small version of it (no cookies,
+  no sessionStorage, no private windows) over SSH to `~/.local/state/browser-handoff/peers/<host>.json` on
+  every machine in hosts.json, at most every 20 seconds. It also holds a logind delay lock, so the machine
+  sends once more right before it suspends (lid closed), and the other machines then offer "Continue here?".
+  `agent-mesh sync` sends too (the only sender on Windows) and installs the service on its first run.
+- **Restoring.** `browser-handoff continue HOST` hands the windows to Firefox's own session restore (the code it
+  uses after a crash) through a small hook. Install it once per machine (`browser-handoff install-firefox` prints
+  the root command: two files in the Firefox install folder, which pacman and Firefox updates leave alone),
+  then restart Firefox. The hook only loads `firefox/handoff.sys.mjs` from the mesh, so changes to it arrive
+  with the mesh. Without the hook, `continue` opens the same pages, without history or scroll positions.
+- `browser-handoff list` shows what each machine had open, `status` the hook, service and last sends,
+  `push --force` sends now. Code: `bin/browser_handoff.py`, `firefox/`.
+- Security: the hook runs `~/.agent-mesh/firefox/handoff.sys.mjs` with browser privileges. Anything that can
+  write to your home folder could already change your Firefox profile, so it adds no new access, but keep
+  the mesh folder yours alone.
 
 ## When it syncs
 

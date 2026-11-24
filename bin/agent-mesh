@@ -12,6 +12,9 @@ machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by 
   agent-mesh sessions     copy the other machines' Claude Code sessions here now (sync does it too,
                           at most every 2 minutes), so `claude --resume` lists them
 
+Every sync also runs browser-handoff (bin/browser_handoff.py): it sends this machine's Firefox windows
+to the others and, on Linux, installs its daemon. `browser-handoff help` for the rest.
+
 Extra Claude Code accounts (e.g. `CLAUDE_CONFIG_DIR=~/.claude-2 claude`) are any ~/.claude-<name>
 folders: sync points their CLAUDE.md, settings, skills, plugins and projects (memory) at ~/.claude.
 The mesh is wherever this script sits (<mesh>/bin/agent-mesh), else $AGENT_MESH_DIR, else ~/.agent-mesh.
@@ -383,6 +386,7 @@ def sync():
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
         share_sessions()
+        share_browser()
         return 'in step' if remote else 'applied (no origin yet: add one with git remote add origin URL)'
     finally:
         LOCK.unlink(missing_ok=True)
@@ -399,6 +403,15 @@ def share_sessions(force=False):
     except Exception as error:
         log(f'sessions failed (mesh sync completed): {error}')
         return False
+
+
+def share_browser():
+    """browser-handoff: install its daemon here (Linux) and send this machine's Firefox windows."""
+    try:
+        from browser_handoff import mesh_sync
+        mesh_sync(log)
+    except Exception as error:
+        log(f'browser-handoff failed (mesh sync completed): {error}')
 
 
 def track_origin():
@@ -452,9 +465,11 @@ def init(args):
     (MEMORY / 'MEMORY.md').write_text('', encoding='utf-8')
     # Start from this machine's settings, so the first sync doesn't take away what you already set.
     write_json(SHARED_SETTINGS, subset(read_json(CLAUDE / 'settings.json', {})))
-    for tool in ('agent-mesh', 'agent_mesh_sessions.py', 'cost'):  # the tools travel with the mesh
+    for tool in ('agent-mesh', 'agent_mesh_sessions.py', 'browser_handoff.py', 'cost'):  # the tools travel with the mesh
         if (TOOL.parent / tool).exists():
             shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
+    if (TOOL.parent.parent / 'firefox').is_dir():  # browser-handoff's Firefox hook
+        shutil.copytree(TOOL.parent.parent / 'firefox', REPO / 'firefox', dirs_exist_ok=True)
     (REPO / '.gitattributes').write_text('*.md merge=union\n', encoding='utf-8')
     (REPO / '.gitignore').write_text('__pycache__/\n*.pyc\n', encoding='utf-8')
     readme = TEMPLATE / 'README.md'
