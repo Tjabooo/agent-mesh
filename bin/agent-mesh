@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""agent-mesh: one set of instructions, memory and settings for Claude Code on every one of your
-machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by default).
+"""agent-mesh: one set of instructions, memory and settings for Claude Code and Codex on every one of
+your machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by default).
 
   agent-mesh init [--origin URL]  make a new mesh in ~/.agent-mesh (once, on your first machine)
   agent-mesh setup        on each machine, after init or a clone: link memory, import AGENTS.md, add the
@@ -9,8 +9,10 @@ machines, kept in step through a git repo you own (the "mesh", ~/.agent-mesh by 
   agent-mesh sync --background   the same, detached (what the Claude Code hooks run)
   agent-mesh timer        also sync every 10 minutes (systemd user timer / Windows scheduled task)
   agent-mesh status       what is linked and whether this machine is in step
-  agent-mesh sessions     copy the other machines' Claude Code sessions here now (sync does it too,
-                          at most every 2 minutes), so `claude --resume` lists them
+  agent-mesh sessions     copy the other machines' Claude Code and Codex sessions here now (sync does it
+                          too, at most every 2 minutes), so `claude --resume` / `codex resume` list them
+  agent-mesh codex-notify [--then CMD...]   Codex's after-turn `notify` (set up by sync): syncs,
+                          then runs the notify command that was there before
 
 Every sync also runs browser-handoff (bin/browser_handoff.py): it sends this machine's Firefox windows
 to the others and, on Linux, installs its daemon. `browser-handoff help` for the rest.
@@ -46,8 +48,10 @@ def find_mesh():
 REPO = find_mesh()
 WINDOWS = sys.platform == 'win32'
 CLAUDE = HOME / '.claude'
+CODEX = HOME / '.codex'
 MEMORY = REPO / 'memory'
 SHARED_SETTINGS = REPO / 'claude' / 'settings.json'
+SHARED_CODEX = REPO / 'codex' / 'config.toml'
 STATE = REPO / '.git' / 'agent-mesh-state.json'   # what was last applied here (never committed)
 LOG = REPO / '.git' / 'agent-mesh.log'
 LOCK = REPO / '.git' / 'agent-mesh.lock'
@@ -56,6 +60,8 @@ IMPORT_LINE = '@' + (('~/' + REPO.relative_to(HOME).as_posix()) if REPO.is_relat
 # permission mode and allow list, machine paths).
 SHARED_KEYS = ('theme', 'modelSettings', 'autoCompactEnabled', 'permissions.deny', 'permissions.ask',
                'enableArtifact', 'disableClaudeAiConnectors', 'skillOverrides')
+CODEX_KEYS = ('model', 'model_reasoning_effort')
+MEMORY_INLINE = 12000  # characters of the newest memories copied into Codex's AGENTS.md; the rest it reads from the index
 HOST = socket.gethostname().lower()
 # Extra Claude accounts (`claude2` = CLAUDE_CONFIG_DIR=~/.claude-2): every ~/.claude-<name> folder.
 # These parts of one are the main ~/.claude's: links (on Windows, files are copies kept in step: a file
@@ -347,6 +353,103 @@ def ensure_claude_md():
         path.write_text(head + ('\n# Only this machine\n' + text if text.strip() else ''), encoding='utf-8')
 
 
+def write_codex():
+    if not CODEX.is_dir():
+        return
+    # Codex reads memory files with its shell, so its copy carries the index plus only the newest
+    # memories in full (the likeliest handovers); inlining everything cost every Codex turn ~13k tokens.
+    memories, size = [], 0
+    for f in sorted(MEMORY.glob('*.md'), key=lambda f: f.stat().st_mtime, reverse=True):
+        if f.name in ('MEMORY.md', 'MEMORY-archive.md'):  # indexes, not memories
+            continue
+        text = f.read_text(encoding='utf-8').strip()
+        if size + len(text) > MEMORY_INLINE:
+            break
+        memories.append(f'### {f.name}\n\n{text}')
+        size += len(text)
+    index = MEMORY / 'MEMORY.md'
+    index = index.read_text(encoding='utf-8').strip() if index.exists() else ''
+    extra = REPO / 'codex' / 'AGENTS.codex.md'  # instructions only Codex gets
+    extra = '\n\n' + extra.read_text(encoding='utf-8').strip() + '\n' if extra.exists() else ''
+    mem_dir = '~/' + MEMORY.relative_to(HOME).as_posix() if MEMORY.is_relative_to(HOME) else MEMORY.as_posix()
+    body = ('<!-- Written by agent-mesh from ~/.agent-mesh/AGENTS.md and the shared memory.\n'
+            '     Edit those instead: this copy is replaced on every sync. -->\n\n'
+            + (REPO / 'AGENTS.md').read_text(encoding='utf-8').rstrip() + '\n' + extra
+            + f'\n## Shared memory (the same memory Claude Code uses; files are in {mem_dir}/)\n\n'
+            'Index of every memory. Before working on a topic listed here, read its file '
+            f'(`cat {mem_dir}/<file>`); the newest ones are also included in full below.\n\n'
+            + (index or '(none yet)') + '\n\n### Newest memories in full\n\n'
+            + ('\n\n'.join(memories) or '(none yet)') + '\n')
+    agents = CODEX / 'AGENTS.md'
+    if not agents.exists() or agents.read_text(encoding='utf-8') != body:
+        agents.write_text(body, encoding='utf-8')
+    # Top-level Codex settings worth sharing; the rest of config.toml is machine-specific.
+    shared = {}
+    if SHARED_CODEX.exists():
+        for line in SHARED_CODEX.read_text(encoding='utf-8').splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key.strip() in CODEX_KEYS:
+                shared[key.strip()] = value.strip()
+    config = CODEX / 'config.toml'
+    if shared and config.exists():
+        lines = config.read_text(encoding='utf-8').splitlines()
+        first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith('[')), len(lines))
+        top = {l.partition('=')[0].strip(): i for i, l in enumerate(lines[:first_table]) if '=' in l}
+        changed, added = False, 0
+        for key, value in shared.items():
+            line = f'{key} = {value}'
+            if key in top:
+                if lines[top[key]] != line:
+                    lines[top[key]], changed = line, True
+            else:  # new keys go first, in the shared file's order
+                lines.insert(added, line)
+                top = {k: i + 1 if i >= added else i for k, i in top.items()}
+                added += 1
+                changed = True
+        if changed:
+            config.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    wrap_codex_notify()
+
+
+def wrap_codex_notify():
+    """Codex runs its `notify` command after every turn: point it at `agent-mesh codex-notify`, which
+    syncs and then runs whatever notify was there before (a plugin's, for example)."""
+    config = CODEX / 'config.toml'
+    if not config.exists():
+        return
+    lines = config.read_text(encoding='utf-8').splitlines()
+    first_table = next((i for i, l in enumerate(lines) if l.lstrip().startswith('[')), len(lines))
+    start = next((i for i in range(first_table) if lines[i].partition('=')[0].strip() == 'notify'), None)
+    old, end = [], start
+    if start is not None:
+        while ']' not in lines[end] and end + 1 < first_table:
+            end += 1
+        try:
+            old = tomllib.loads('\n'.join(lines[start:end + 1]))['notify']
+        except (tomllib.TOMLDecodeError, KeyError):
+            log('codex notify left alone: it could not be read')
+            return
+    if 'codex-notify' in old:  # ours already: keep what it chains to, refresh our own paths
+        old = old[old.index('--then') + 1:] if '--then' in old else []
+    ours = [python(quiet=True), (REPO / 'bin' / 'agent-mesh').as_posix(), 'codex-notify', *(['--then', *old] if old else [])]
+    line = 'notify = ' + json.dumps(ours)  # a JSON list of strings is valid TOML
+    if start is None:
+        lines.insert(0, line)
+    elif lines[start:end + 1] == [line]:
+        return
+    else:
+        lines[start:end + 1] = [line]
+    config.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def codex_notify(args):
+    """Codex's after-turn hook: sync in the background, then hand Codex's arguments (the event JSON is
+    the last one) to the notify command that was configured before agent-mesh."""
+    detach([sys.executable, str(Path(__file__).resolve()), 'sync'])
+    if '--then' in args and args[args.index('--then') + 1:]:
+        detach(args[args.index('--then') + 1:])
+
+
 # ---------- sync ----------
 def locked():
     try:
@@ -383,6 +486,7 @@ def sync():
             git('push', '-q', timeout=60)
         apply_settings(state)
         ensure_claude_md()
+        write_codex()
         sync_accounts()  # again, to refresh Windows copies with what was just applied
         write_json(STATE, state)
         share_sessions()
@@ -427,18 +531,19 @@ def track_origin():
 # ---------- init, timer ----------
 AGENTS_TEMPLATE = """# Shared instructions for every agent on my machines
 
-This file is shared by Claude Code on all my machines through agent-mesh. Claude Code imports it from
-`~/.claude/CLAUDE.md`. **Edit it in the mesh (`{mesh}/AGENTS.md`), never in that file.** Other machines
-get a change on their next sync.
+This file is shared by Claude Code and Codex on all my machines through agent-mesh. Claude Code imports
+it from `~/.claude/CLAUDE.md`; Codex gets a copy as `~/.codex/AGENTS.md`. **Edit it in the mesh
+(`{mesh}/AGENTS.md`), never in those copies.** Other machines get a change on their next sync.
 
 ## About me
 - (Who you are, how you like to work, standing permissions such as pushing without asking.)
 
-## One brain across machines
+## One brain across machines and agents
 - **Memory is shared.** Claude Code's memory folder for every project on every machine is linked to
-  `{mesh}/memory/` (index: `MEMORY.md`). Save what would help on
-  another machine or in another project, in the usual memory format (a file plus one
+  `{mesh}/memory/` (index: `MEMORY.md`); Codex gets the index and newest memories in its AGENTS.md. Save what would help on
+  another machine, in another project or to the other agent, in the usual memory format (a file plus one
   index line); machine-specific facts say which machine they're about.
+- **Codex: write to `{mesh}/memory/`, not your built-in memory.** Claude Code can't see Codex's own memory.
 - **Before you finish a task, leave a handover** in memory if work is unfinished: what was done, where
   (machine, folder, branch, commit), what's left. Then run `agent-mesh sync`.
 - **Starting a task that continues recent work:** run `agent-mesh sync` first, then read the memory files
@@ -465,6 +570,12 @@ def init(args):
     (MEMORY / 'MEMORY.md').write_text('', encoding='utf-8')
     # Start from this machine's settings, so the first sync doesn't take away what you already set.
     write_json(SHARED_SETTINGS, subset(read_json(CLAUDE / 'settings.json', {})))
+    codex = (CODEX / 'config.toml').read_text(encoding='utf-8').splitlines() if (CODEX / 'config.toml').exists() else []
+    first_table = next((i for i, l in enumerate(codex) if l.lstrip().startswith('[')), len(codex))
+    keep = [l for l in codex[:first_table] if l.partition('=')[0].strip() in CODEX_KEYS]
+    SHARED_CODEX.parent.mkdir(exist_ok=True)
+    SHARED_CODEX.write_text('# Top-level Codex settings shared by every machine (agent-mesh copies them into ~/.codex/config.toml)\n'
+                            + ''.join(l + '\n' for l in keep), encoding='utf-8')
     for tool in ('agent-mesh', 'agent_mesh_sessions.py', 'browser_handoff.py', 'cost'):  # the tools travel with the mesh
         if (TOOL.parent / tool).exists():
             shutil.copy2(TOOL.parent / tool, REPO / 'bin' / tool)
@@ -549,6 +660,7 @@ def status():
         bad = [n for n in ACCOUNT_SHARED if (CLAUDE / n).exists() and not (
             is_link(account / n) or (account / n).is_file() and (account / n).read_bytes() == (CLAUDE / n).read_bytes())]
         print(f"account {account.name}: {'shares ~/.claude' if not bad else 'NOT shared: ' + ', '.join(bad)}")
+    print('Codex AGENTS.md written:', (CODEX / 'AGENTS.md').exists() if CODEX.is_dir() else 'no Codex here')
     print('memories:', len([f for f in MEMORY.glob('*.md') if f.name != 'MEMORY.md']))
 
 
@@ -575,6 +687,8 @@ def main():
             sys.exit(1)
     elif args[0] == 'status':
         status()
+    elif args[0] == 'codex-notify':
+        codex_notify(args[1:])
     elif args[0] == 'sessions':
         if not locked():
             sys.exit('another sync is running; try again in a moment')

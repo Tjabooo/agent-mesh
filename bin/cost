@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""cost: what your Claude Code chats would have cost at API prices, across machines.
+"""cost: what your Claude Code and Codex chats would have cost at API prices, across machines.
 
-Reads the transcripts Claude Code already keeps (~/.claude/projects/**/*.jsonl), prices every API
-call with the published per-token rates and adds them up. Other machines are scanned over SSH: this script is piped to their Python, so
+Reads the transcripts the two CLIs already keep (~/.claude/projects/**/*.jsonl and
+~/.codex/sessions/**/*.jsonl), prices every API call with the published per-token rates and
+adds them up. Other machines are scanned over SSH: this script is piped to their Python, so
 nothing has to be installed there.
 
   cost                  all machines, everything
@@ -43,6 +44,12 @@ CLAUDE = {
 }
 HAIKU_LONG = 100_000            # Haiku 5.5 prompts above this cost 5x
 FAST = {'claude-opus-5-5': 2, 'claude-opus-5': 2, 'claude-opus-4-8': 2}  # fast mode multiplier
+# Codex (OpenAI): in, cached in, out. Requests over 272K input: 2x input/cached, 1.5x output.
+CODEX = {
+    'gpt-6-astra': (10, 1.0, 50), 'gpt-6.1-sol': (2, 0.10, 10),
+    'gpt-6.1-terra': (None, None, None), 'gpt-6-luna': (0.10, 0.01, 0.50),
+}
+OPENAI_LONG = 272_000
 
 
 def claude_price(model, u, speed):
@@ -61,6 +68,18 @@ def claude_price(model, u, speed):
         mult *= 5
     cost = (inp * pin + w5m * pin * 1.25 + w1h * pin * 2 + read * pread + out * pout) * mult / M
     return cost, read * (pin - pread) * mult / M
+
+
+def codex_price(model, u, tier):
+    p = CODEX.get(model)
+    if not p or p[0] is None:
+        return None, 0.0
+    pin, pcache, pout = p
+    inp, cached, out = u.get('input_tokens', 0) or 0, u.get('cached_input_tokens', 0) or 0, u.get('output_tokens', 0) or 0
+    min_, mout = (2, 1.5) if inp > OPENAI_LONG else (1, 1)
+    fast = 2 if tier in ('priority', 'fast') else 1
+    cost = ((inp - cached) * pin * min_ + cached * pcache * min_ + out * pout * mout) * fast / M
+    return cost, cached * (pin - pcache) * min_ * fast / M
 
 
 def local_day(ts):
@@ -164,9 +183,62 @@ def scan_claude(rows, seen):
                      reasoning=od.get('thinking_tokens'))
 
 
+def scan_codex(rows, seen):
+    home = Path.home() / '.codex'
+    try:
+        for line in open(home / 'session_index.jsonl', encoding='utf-8', errors='replace'):
+            try:
+                d = json.loads(line)
+                rows.titles[d['id']] = d.get('thread_name', '')
+            except (ValueError, KeyError):
+                pass
+    except OSError:
+        pass
+    files = [f for sub in ('sessions', 'archived_sessions') if (home / sub).is_dir() for f in (home / sub).rglob('*.jsonl')]
+    for f in sorted(files):
+        turn_model, model, tier, session, have_records, last_total = {}, '?', None, f.stem[-36:], False, None
+        pending = []
+        for d in jsonl(f, ('turn_context', 'token_usage_record', 'token_count', 'session_meta')):
+            t, p = d.get('type'), d.get('payload') or {}
+            if t == 'session_meta':
+                session = p.get('id') or session
+            elif t == 'turn_context':
+                model = p.get('model') or model
+                tier = p.get('service_tier') or tier
+                if p.get('turn_id'):
+                    turn_model[p['turn_id']] = (model, tier)
+            elif t == 'token_usage_record':
+                have_records = True
+                rid = p.get('response_id')
+                if rid and rid in seen:
+                    continue
+                seen.add(rid)
+                pending.append((p.get('turn_id'), p.get('usage') or {}, d.get('timestamp'), p.get('session_id') or session))
+            elif t == 'event_msg' and p.get('type') == 'token_count' and not have_records:
+                info = p.get('info') or {}
+                total = json.dumps(info.get('total_token_usage'), sort_keys=True)
+                if info.get('last_token_usage') and total != last_total:  # older Codex: no per-response records
+                    last_total = total
+                    pending.append((None, info['last_token_usage'], d.get('timestamp'), session, model, tier))
+        for item in pending:
+            if have_records and len(item) == 6:
+                continue
+            turn, u, ts, sess = item[:4]
+            m, tr = item[4:6] if len(item) == 6 else turn_model.get(turn, (model, tier))
+            if not (u.get('input_tokens') or u.get('output_tokens')):
+                continue
+            cost, saved = codex_price(m, u, tr)
+            cached = u.get('cached_input_tokens') or 0
+            rows.add('codex', m, local_day(ts), sess, cost, saved,
+                     input=(u.get('input_tokens') or 0) - cached, cache_read=cached,
+                     cache_write=u.get('cache_write_input_tokens'), output=u.get('output_tokens'),
+                     reasoning=u.get('reasoning_output_tokens'))
+
+
 def scan():
     rows = Rows()
     scan_claude(rows, set())
+    scan_codex(rows, set())
     return rows.out()
 
 
@@ -311,7 +383,7 @@ def report(data, errors, args):
             note = dim(' (no price known)') if v['unpriced'] and not v['cost'] else ''
             print(f'   {label(k):<20}{usd(v["cost"]):>11}  {dim(f"{pct:4.0f}%")}  {bar(v["cost"] / top)}{note}')
 
-    table('By agent', summed(rows, lambda r: r['tool']), {'claude': 'Claude Code'}.get)
+    table('By agent', summed(rows, lambda r: r['tool']), {'claude': 'Claude Code', 'codex': 'Codex'}.get)
     if len(data) > 1:
         table('By machine', summed(rows, lambda r: r['machine']))
     models = summed(rows, lambda r: r['model'])
